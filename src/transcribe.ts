@@ -1,2 +1,2 @@
-import Transcribe from 'code/transcribe'
+import Transcribe from 'code/transcribe/command'
 export default Transcribe
