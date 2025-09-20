@@ -26,6 +26,7 @@
   },
   "dependencies": {
     "@deepgram/sdk": "^4.11.2",
+    "@google/genai": "^1.20.0",
     "@oclif/core": "^4.5.3",
     "@oclif/plugin-autocomplete": "^3.2.34",
     "ahocon": "^0.2.7",

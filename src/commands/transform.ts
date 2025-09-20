@@ -1,2 +1,2 @@
-import Transform from 'code/transform'
+import Transform from 'code/transform/command'
 export default Transform
