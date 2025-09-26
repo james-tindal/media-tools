@@ -1,5 +1,5 @@
 import { GoogleGenAI } from '@google/genai'
-import secrets from 'code/utilities/read-secrets'
+import secrets from 'code/config/read-secrets'
 import { readFile } from 'node:fs/promises'
 import { Config } from './configSchema'
 import { createWriteStream } from 'node:fs'

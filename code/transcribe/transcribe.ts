@@ -1,7 +1,7 @@
 import { createClient } from '@deepgram/sdk'
 import fs from 'node:fs'
 import { writeFile } from 'node:fs/promises'
-import secrets from 'code/utilities/read-secrets'
+import secrets from 'code/config/read-secrets'
 import logger from './logger'
 import path from 'node:path'
 import { Readable } from 'node:stream'

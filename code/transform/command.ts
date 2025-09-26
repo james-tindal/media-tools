@@ -1,6 +1,6 @@
 import { Args, Command, Flags } from '@oclif/core'
 import transform from './transform'
-import { getProfile, profileNames } from 'code/utilities/read-profiles'
+import { getProfile, profileNames } from 'code/config/read-profiles'
 
 
 export default class Transform extends Command {
