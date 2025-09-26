@@ -1,5 +1,5 @@
 {
-  "name": "ai-tools",
+  "name": "media-tools",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
@@ -13,12 +13,12 @@
     "transform": "./dist/commands/transform.js"
   },
   "bin": {
-    "ai-tools": "./bin/run.js"
+    "media-tools": "./bin/run.js"
   },
   "oclif": {
-    "bin": "ai-tools",
+    "bin": "media-tools",
     "commands": "./dist/commands/",
-    "dirname": "ai-tools",
+    "dirname": "media-tools",
     "topicSeparator": " ",
     "plugins": [
       "@oclif/plugin-autocomplete"
