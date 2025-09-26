@@ -1,0 +1,4 @@
+
+
+Must add this in somewhere as well
+I already have a bash script to do it
