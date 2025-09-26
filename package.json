@@ -9,15 +9,15 @@
     "link": "npm link # makes the items in package.json/bin available globally"
   },
   "exports": {
-    "transcribe": "./dist/transcribe.js",
-    "transform": "./dist/transform.js"
+    "transcribe": "./dist/commands/transcribe.js",
+    "transform": "./dist/commands/transform.js"
   },
   "bin": {
     "ai-tools": "./bin/run.js"
   },
   "oclif": {
     "bin": "ai-tools",
-    "commands": "./dist/",
+    "commands": "./dist/commands/",
     "dirname": "ai-tools",
     "topicSeparator": " ",
     "plugins": [
