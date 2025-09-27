@@ -12,6 +12,7 @@ const profilesDir = resolve(rootDir, 'profiles')
 export const profileNames =
   (await readdir(profilesDir))
   .filter(fileName => fileName.endsWith('.conf'))
+  .map(fileName => fileName.slice(0, -5))
 
 export async function getProfile(profileName: string) {
   const file = await readFile(resolve(profilesDir, `${profileName}.conf`), 'utf-8')

@@ -26,6 +26,8 @@ export default class Transform extends Command {
     const sourcePaths = argv as string[]
     const config = await getProfile(profile)
 
+    console.log(`\nSystem instruction:\n${config.transform.systemInstruction}`)
+
     for (const sourcePath of sourcePaths)
       await transform(sourcePath, config.transform)
   }
