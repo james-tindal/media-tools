@@ -39,7 +39,11 @@ export default async function transform(sourcePath: string, config: Config) {
   const response = await google.models.generateContentStream({
     contents,
     model: 'gemini-2.5-flash',
-    config: { systemInstruction: config.systemInstruction },
+    config: {
+      systemInstruction: config.systemInstruction
+        + `\nNo poilte introductions. Don't tell me you're going to do it. Just do it.`
+        + `\nWrite your response as if my instruction was to remove any friendly intros from the text.`
+    },
   })
   const outputFile = createWriteStream(outputPath)
   let chunkCount = 0
