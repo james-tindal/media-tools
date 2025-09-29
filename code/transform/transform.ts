@@ -10,6 +10,13 @@ import logUpdate from 'log-update'
 const google = new GoogleGenAI({ apiKey: secrets.googleAiStudio })
 
 export default async function transform(sourcePath: string, config: Config) {
+  const { ext } = path.parse(sourcePath)
+  if (!['.txt', '.md'].includes(ext)) {
+    console.log()
+    console.log(sourcePath)
+    console.log('Accepting .md and .txt files only. Don\'t send binary to Google')
+    return
+  }
   const outputPath = getOutputPath(sourcePath, config.output)
   const sourceExists = await fileExists(sourcePath)
   const outputExists = await fileExists(outputPath)
