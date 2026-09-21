@@ -1,5 +1,7 @@
-#!/usr/bin/env -S tsx
+#!/usr/bin/env node
 
 import {execute} from '@oclif/core'
+import {register} from 'tsx/esm/api'
 
-await execute({development: true, dir: import.meta.url})
+register()
+await execute({dir: import.meta.url})
