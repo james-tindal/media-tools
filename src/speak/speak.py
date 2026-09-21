@@ -45,7 +45,7 @@ def main():
   args = parse_args()
   text = args.file.read_text(encoding='utf-8')
   tts = TTS()
-  chunks = chunk_text(text, max_chunk_length=args.max_chunk_length)
+  chunks = chunk_text(text, max_len=args.max_chunk_length)
   audio = Queue(maxsize=args.buffer)
   with ThreadPoolExecutor(max_workers=1) as executor:
     future = executor.submit(synthesise, chunks, audio, tts, args)

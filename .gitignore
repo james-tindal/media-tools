@@ -1,5 +1,6 @@
 
 node_modules/
+/src/speak/.venv/
 /secrets.conf
 /to do
 /profiles/
