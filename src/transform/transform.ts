@@ -1,10 +1,10 @@
 import { GoogleGenAI } from '@google/genai'
-import secrets from 'code/config/read-secrets'
+import secrets from 'src/config/read-secrets'
 import { readFile } from 'node:fs/promises'
 import { Config } from './configSchema'
 import { createWriteStream } from 'node:fs'
 import path from 'node:path'
-import { fileExists } from 'code/utilities'
+import { fileExists } from 'src/utilities'
 import logUpdate from 'log-update'
 
 const google = new GoogleGenAI({ apiKey: secrets.googleAiStudio })
