@@ -19,9 +19,11 @@ export default class Speak extends Command {
 
   static override examples = [
     '<%= config.bin %> <%= command.id %> document.txt',
+    '<%= config.bin %> <%= command.id %> document.txt --output speech.wav',
   ]
 
   static override flags = {
+    output: Flags.file({ char: 'o', description: 'Write audio to this file instead of playing it' }),
     voice: Flags.string({ default: 'M1', description: 'Supertonic voice style' }),
     lang: Flags.string({ description: 'Language code' }),
     speed: float({ default: 1.05, description: 'Speech speed' }),
@@ -50,6 +52,7 @@ export default class Speak extends Command {
     ]
 
     if (flags.lang) uvArgs.push('--lang', flags.lang)
+    if (flags.output) uvArgs.push('--output', flags.output)
 
     let result: { code: number | null, signal: NodeJS.Signals | null }
     try {
