@@ -1,17 +1,10 @@
 import argparse
-import sys
-import subprocess
-import tempfile
+import math
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
-
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
 
 from supertonic import TTS
-from supertonic.utils import chunk_text
+
+from batch import prepare_jobs, run_batch
 
 
 def parse_format(value):
@@ -30,8 +23,10 @@ def parse_format(value):
 def parse_args():
   parser = argparse.ArgumentParser(description='Read a text file aloud with Supertonic')
 
-  parser.add_argument('file', type=Path)
-  parser.add_argument('-o', '--output', type=Path, help='Write audio to this file instead of playing it')
+  parser.add_argument('paths', nargs='+', type=Path, help='Markdown/text files or directories (recursive)')
+  parser.add_argument('-o', '--output', type=Path, help='Write one input to a WAV or Opus file instead of playing it')
+  parser.add_argument('--output-dir', type=Path, help='Write one Opus file per input to this directory')
+  parser.add_argument('--overwrite', action='store_true', help='Replace existing audio after synthesis and verification succeed')
   parser.add_argument('--format', type=parse_format, metavar='opus[:KBPS]',
                       help='Encode Opus with FFmpeg using a target bitrate in kbps (default: 24). Requires --output')
   parser.add_argument('--voice', default='M1')
@@ -43,96 +38,20 @@ def parse_args():
   parser.add_argument('--buffer', type=int, default=3, help='Number of synthesised chunks to buffer ahead')
 
   args = parser.parse_args()
-  if args.format is not None and args.output is None:
-    parser.error('--format requires --output')
+  if (not args.voice.strip() or args.steps < 1 or args.max_chunk_length < 1
+      or args.buffer < 1 or not math.isfinite(args.speed) or args.speed <= 0
+      or not math.isfinite(args.silence_duration) or args.silence_duration < 0):
+    parser.error('Invalid synthesis parameters: voice must be nonempty; steps, speed, chunk length, and buffer must be positive; silence must be finite and nonnegative')
   return args
-
-def show_progress(completed, total):
-  width = 30
-  ratio = completed / total if total else 1
-  filled = round(width * ratio)
-  bar = '#' * filled + '-' * (width - filled)
-  sys.stderr.write(f'\rSynthesising [{bar}] {completed}/{total} {ratio:>4.0%}')
-  sys.stderr.flush()
-
-
-def synthesise(chunks, audio, tts, args):
-  voice = tts.get_voice_style(args.voice)
-  show_progress(0, len(chunks))
-  try:
-    for index, chunk in enumerate(chunks, start=1):
-      wav, _ = tts.synthesize(
-        chunk,
-        voice_style=voice,
-        lang=args.lang,
-        speed=args.speed,
-        total_steps=args.steps,
-        silence_duration=0,
-      )
-
-      show_progress(index, len(chunks))
-      audio.put(wav.squeeze())
-
-  finally:
-    sys.stderr.write('\n')
-    audio.put(None)
 
 def main():
   args = parse_args()
-  text = args.file.read_text(encoding='utf-8')
+  jobs = prepare_jobs(args)
+  print('Loading Supertonic...', flush=True)
   tts = TTS()
-  chunks = chunk_text(text, max_len=args.max_chunk_length)
-  audio = Queue(maxsize=args.buffer)
-  output = None
-  temporary = None
-
-  try:
-    output_path = args.output
-    if args.format is not None:
-      temporary = tempfile.TemporaryDirectory(prefix='media-tools-speak-')
-      output_path = Path(temporary.name) / 'speech.wav'
-    if output_path:
-      output = sf.SoundFile(output_path, mode='w', samplerate=tts.sample_rate, channels=1)
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-      future = executor.submit(synthesise, chunks, audio, tts, args)
-      completed = 0
-
-      while True:
-        wav = audio.get()
-
-        if wav is None:
-          break
-
-        if output:
-          if completed and args.silence_duration:
-            silence = np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32)
-            output.write(silence)
-          output.write(wav)
-        else:
-          sd.play(wav, tts.sample_rate)
-          sd.wait()
-
-          if completed < len(chunks) - 1 and args.silence_duration:
-            sd.sleep(int(args.silence_duration * 1000))
-
-        completed += 1
-
-      future.result()
-    if output:
-      output.close()
-      output = None
-    if args.format is not None:
-      subprocess.run([
-        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
-        '-i', str(output_path), '-c:a', 'libopus', '-b:a', f'{args.format}k',
-        '-vbr', 'on', '-f', 'opus', str(args.output),
-      ], check=True)
-  finally:
-    if output:
-      output.close()
-    if temporary:
-      temporary.cleanup()
+  # All input and destination checks happen before the model loads once.
+  tts.get_voice_style(args.voice)
+  run_batch(jobs, args, tts)
 
 
 if __name__ == '__main__': main()
