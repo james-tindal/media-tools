@@ -31,13 +31,25 @@ def split_text(text, max_len):
             continue
         start = None
         end = None
-        for word in re.finditer(r"\S+", chunk):
-            if start is not None and word.end() - start > max_len:
+        units = []
+        if "|" in chunk:
+            for cell in re.finditer(r"[^|]*\||[^|]+$", chunk):
+                if len(cell.group().strip()) > max_len:
+                    units.extend((cell.start() + word.start(), cell.start() + word.end())
+                                 for word in re.finditer(r"\S+", cell.group()))
+                elif cell.group().strip():
+                    leading = len(cell.group()) - len(cell.group().lstrip())
+                    units.append((cell.start() + leading,
+                                  cell.start() + len(cell.group().rstrip())))
+        else:
+            units = [(word.start(), word.end()) for word in re.finditer(r"\S+", chunk)]
+        for unit_start, unit_end in units:
+            if start is not None and unit_end - start > max_len:
                 chunks.append(chunk[start:end])
                 start = None
             if start is None:
-                start = word.start()
-            end = word.end()
+                start = unit_start
+            end = unit_end
         if start is not None:
             chunks.append(chunk[start:end])
     return chunks
