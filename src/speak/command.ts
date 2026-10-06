@@ -65,16 +65,18 @@ export default class Speak extends Command {
     if (flags.format) uvArgs.push('--format', flags.format)
     if (flags.overwrite) uvArgs.push('--overwrite')
 
+    const executable = process.platform === 'darwin' ? 'caffeinate' : 'uv'
+    const spawnArgs = process.platform === 'darwin' ? ['-i', 'uv', ...uvArgs] : uvArgs
     let result: { code: number | null, signal: NodeJS.Signals | null }
     try {
       result = await new Promise((resolveResult, reject) => {
-        const child = spawn('uv', uvArgs, { stdio: 'inherit' })
+        const child = spawn(executable, spawnArgs, { stdio: 'inherit' })
         child.once('error', reject)
         child.once('close', (code, signal) => resolveResult({ code, signal }))
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      this.error(`Unable to start uv: ${message}`)
+      this.error(`Unable to start ${executable}: ${message}`)
     }
 
     if (result.code !== 0) {
