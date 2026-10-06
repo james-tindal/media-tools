@@ -23,8 +23,28 @@ class IncompleteSynthesisError(RuntimeError):
     """Some chunks failed; successful chunks remain available for resume."""
 
 
+def split_text(text, max_len):
+    chunks = []
+    for chunk in chunk_text(re.sub(r" {2,}", " ", text), max_len=max_len):
+        if len(chunk) <= max_len:
+            chunks.append(chunk)
+            continue
+        start = None
+        end = None
+        for word in re.finditer(r"\S+", chunk):
+            if start is not None and word.end() - start > max_len:
+                chunks.append(chunk[start:end])
+                start = None
+            if start is None:
+                start = word.start()
+            end = word.end()
+        if start is not None:
+            chunks.append(chunk[start:end])
+    return chunks
+
+
 def synthesise_resumable(text, destination, tts, args, cache_root, conversion):
-    chunks = chunk_text(re.sub(r" {2,}", " ", text), max_len=args.max_chunk_length)
+    chunks = split_text(text, args.max_chunk_length)
     if not chunks:
         raise ValueError("No text chunks to synthesise")
     metadata = synthesis_metadata(text, conversion, args, None)
@@ -120,7 +140,7 @@ def produce_chunks(chunks, audio, tts, voice, args):
 
 def synthesise_audio(text, destination, tts, args):
     """Write a WAV, or play audio if destination is None."""
-    chunks = chunk_text(re.sub(r" {2,}", " ", text), max_len=args.max_chunk_length)
+    chunks = split_text(text, args.max_chunk_length)
     if not chunks:
         raise ValueError("No text chunks to synthesise")
     voice = tts.get_voice_style(args.voice)
