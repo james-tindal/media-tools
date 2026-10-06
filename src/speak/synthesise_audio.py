@@ -2,6 +2,11 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
 import subprocess
 import sys
 
@@ -9,6 +14,80 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from supertonic.utils import chunk_text
+
+from audio_metadata import embed_metadata, synthesis_metadata
+
+
+class IncompleteSynthesisError(RuntimeError):
+    """Some chunks failed; successful chunks remain available for resume."""
+
+
+def synthesise_resumable(text, destination, tts, args, cache_root, conversion):
+    chunks = chunk_text(text, max_len=args.max_chunk_length)
+    if not chunks:
+        raise ValueError("No text chunks to synthesise")
+    metadata = synthesis_metadata(text, conversion, args, None)
+    metadata["tts_model"] = tts.model_name
+    metadata["tts_sample_rate"] = str(tts.sample_rate)
+    metadata["chunk_cache_version"] = "1"
+    identity = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
+    cache = Path(cache_root) / identity
+    cache.mkdir(parents=True, exist_ok=True)
+    voice = tts.get_voice_style(args.voice)
+    failed = []
+    paths = []
+    for index, chunk in enumerate(chunks, start=1):
+        path = cache / f"{index:06d}.wav"
+        tags = dict(metadata)
+        tags["chunk_text_sha256"] = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+        tags["chunk_index"] = str(index)
+        tags["chunk_count"] = str(len(chunks))
+        paths.append(path)
+        try:
+            reusable = False
+            if path.exists():
+                result = subprocess.run([
+                    "ffprobe", "-v", "error", "-show_entries", "format_tags",
+                    "-of", "json", str(path),
+                ], check=True, capture_output=True, text=True)
+                fields = json.loads(result.stdout).get("format", {}).get("tags", {})
+                stored = json.loads(fields.get("comment", "{}"))
+                info = sf.info(path)
+                reusable = (stored == tags and info.frames > 0
+                            and info.samplerate == tts.sample_rate and info.channels == 1)
+                if not reusable:
+                    print(f"Chunk {index}: cached audio does not match; synthesising again", file=sys.stderr)
+            if not reusable:
+                wav, _ = tts.synthesize(
+                    chunk, voice_style=voice, lang=args.lang, speed=args.speed,
+                    total_steps=args.steps, silence_duration=0,
+                )
+                samples = np.asarray(wav).reshape(-1)
+                if not samples.size or not np.isfinite(samples).all():
+                    raise ValueError("Synthesis returned empty or nonfinite audio")
+                with tempfile.TemporaryDirectory(prefix=".chunk-", dir=cache) as directory:
+                    raw = Path(directory) / "raw.wav"
+                    tagged = Path(directory) / "tagged.wav"
+                    sf.write(raw, samples, tts.sample_rate, subtype="FLOAT")
+                    embed_metadata(raw, tagged, tags, False)
+                    os.replace(tagged, path)
+        except Exception as error:
+            failed.append(index)
+            print(f"\nChunk {index}/{len(chunks)} failed: {type(error).__name__}: {error}", file=sys.stderr)
+        show_progress(index, len(chunks))
+    sys.stderr.write("\n")
+    if failed:
+        raise IncompleteSynthesisError(
+            f"Failed chunks: {', '.join(map(str, failed))}. Saved chunks: {cache}. No final audio assembled."
+        )
+    with sf.SoundFile(destination, mode="w", samplerate=tts.sample_rate,
+                      channels=1, subtype="FLOAT") as output:
+        for index, path in enumerate(paths):
+            if index and args.silence_duration:
+                output.write(np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32))
+            with sf.SoundFile(path) as source:
+                for block in source.blocks(blocksize=65536, dtype="float32"):
+                    output.write(block)
 
 
 def show_progress(completed, total):

@@ -8,7 +8,7 @@ import tempfile
 
 from audio_metadata import embed_metadata, synthesis_metadata
 from markdown_conversion import CONVERSION, markdown_to_text
-from synthesise_audio import encode_opus, synthesise_audio
+from synthesise_audio import IncompleteSynthesisError, encode_opus, synthesise_audio, synthesise_resumable
 
 
 @dataclass(frozen=True)
@@ -99,7 +99,10 @@ def process_job(job, args, tts):
     with tempfile.TemporaryDirectory(prefix=".media-tools-speak-", dir=output.parent) as directory:
         temporary = Path(directory)
         wav_path = temporary / "speech.wav"
-        synthesise_audio(job.text, wav_path, tts, args)
+        synthesise_resumable(
+            job.text, wav_path, tts, args,
+            output.parent / f".{output.name}.chunks", job.conversion,
+        )
         raw = wav_path
         opus = job.bitrate is not None
         if opus:
@@ -118,6 +121,15 @@ def process_job(job, args, tts):
 
 
 def run_batch(jobs, args, tts):
+    incomplete = []
     for index, job in enumerate(jobs, start=1):
         print(f"[{index}/{len(jobs)}] {job.source}", flush=True)
-        process_job(job, args, tts)
+        try:
+            process_job(job, args, tts)
+        except IncompleteSynthesisError as error:
+            incomplete.append(str(job.source))
+            print(f"Incomplete input {job.source}: {error}", flush=True)
+    if incomplete:
+        raise IncompleteSynthesisError(
+            "Incomplete inputs:\n" + "\n".join(incomplete)
+        )
