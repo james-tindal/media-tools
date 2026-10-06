@@ -89,7 +89,7 @@ def prepare_jobs(args):
     return jobs
 
 
-def process_job(job, args, tts):
+def process_job(job, args, tts, pool=None):
     if job.destination is None:
         synthesise_audio(job.text, None, tts, args)
         return
@@ -101,7 +101,7 @@ def process_job(job, args, tts):
         wav_path = temporary / "speech.wav"
         synthesise_resumable(
             job.text, wav_path, tts, args,
-            output.parent / f".{output.name}.chunks", job.conversion,
+            output.parent / f".{output.name}.chunks", job.conversion, pool,
         )
         raw = wav_path
         opus = job.bitrate is not None
@@ -120,12 +120,12 @@ def process_job(job, args, tts):
     print(f"Saved {output} (SHA-256 {metadata['source_text_sha256']})", flush=True)
 
 
-def run_batch(jobs, args, tts):
+def run_batch(jobs, args, tts, pool=None):
     incomplete = []
     for index, job in enumerate(jobs, start=1):
         print(f"[{index}/{len(jobs)}] {job.source}", flush=True)
         try:
-            process_job(job, args, tts)
+            process_job(job, args, tts, pool)
         except IncompleteSynthesisError as error:
             incomplete.append(str(job.source))
             print(f"Incomplete input {job.source}: {error}", flush=True)

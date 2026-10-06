@@ -1,6 +1,6 @@
 """Supertonic chunk synthesis, buffered playback, and Opus encoding."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 import hashlib
 import json
@@ -43,7 +43,53 @@ def split_text(text, max_len):
     return chunks
 
 
-def synthesise_resumable(text, destination, tts, args, cache_root, conversion):
+def initialize_worker(args):
+    from supertonic import TTS
+    global worker_tts, worker_voice, worker_args
+    worker_args = args
+    worker_tts = TTS(intra_op_num_threads=args.threads)
+    worker_voice = worker_tts.get_voice_style(args.voice)
+
+
+def worker_description():
+    return {"model_name": worker_tts.model_name, "sample_rate": worker_tts.sample_rate}
+
+
+def cache_matches(path, tags, sample_rate):
+    if not path.exists():
+        return False
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries", "format_tags",
+        "-of", "json", str(path),
+    ], check=True, capture_output=True, text=True)
+    fields = json.loads(result.stdout).get("format", {}).get("tags", {})
+    stored = json.loads(fields.get("comment", "{}"))
+    info = sf.info(path)
+    return (stored == tags and info.frames > 0
+            and info.samplerate == sample_rate and info.channels == 1)
+
+
+def save_chunk(chunk, path, tags, tts, voice, args):
+    wav, _ = tts.synthesize(
+        chunk, voice_style=voice, lang=args.lang, speed=args.speed,
+        total_steps=args.steps, silence_duration=0,
+    )
+    samples = np.asarray(wav).reshape(-1)
+    if not samples.size or not np.isfinite(samples).all():
+        raise ValueError("Synthesis returned empty or nonfinite audio")
+    with tempfile.TemporaryDirectory(prefix=".chunk-", dir=path.parent) as directory:
+        raw = Path(directory) / "raw.wav"
+        tagged = Path(directory) / "tagged.wav"
+        sf.write(raw, samples, tts.sample_rate, subtype="FLOAT")
+        embed_metadata(raw, tagged, tags, False)
+        os.replace(tagged, path)
+
+
+def synthesize_worker_chunk(chunk, path, tags):
+    save_chunk(chunk, path, tags, worker_tts, worker_voice, worker_args)
+
+
+def synthesise_resumable(text, destination, tts, args, cache_root, conversion, pool=None):
     chunks = split_text(text, args.max_chunk_length)
     if not chunks:
         raise ValueError("No text chunks to synthesise")
@@ -54,9 +100,11 @@ def synthesise_resumable(text, destination, tts, args, cache_root, conversion):
     identity = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
     cache = Path(cache_root) / identity
     cache.mkdir(parents=True, exist_ok=True)
-    voice = tts.get_voice_style(args.voice)
+    voice = tts.get_voice_style(args.voice) if pool is None else None
     failed = []
     paths = []
+    pending = {}
+    completed = 0
     for index, chunk in enumerate(chunks, start=1):
         path = cache / f"{index:06d}.wav"
         tags = dict(metadata)
@@ -65,37 +113,28 @@ def synthesise_resumable(text, destination, tts, args, cache_root, conversion):
         tags["chunk_count"] = str(len(chunks))
         paths.append(path)
         try:
-            reusable = False
-            if path.exists():
-                result = subprocess.run([
-                    "ffprobe", "-v", "error", "-show_entries", "format_tags",
-                    "-of", "json", str(path),
-                ], check=True, capture_output=True, text=True)
-                fields = json.loads(result.stdout).get("format", {}).get("tags", {})
-                stored = json.loads(fields.get("comment", "{}"))
-                info = sf.info(path)
-                reusable = (stored == tags and info.frames > 0
-                            and info.samplerate == tts.sample_rate and info.channels == 1)
-                if not reusable:
-                    print(f"Chunk {index}: cached audio does not match; synthesising again", file=sys.stderr)
+            reusable = cache_matches(path, tags, tts.sample_rate)
             if not reusable:
-                wav, _ = tts.synthesize(
-                    chunk, voice_style=voice, lang=args.lang, speed=args.speed,
-                    total_steps=args.steps, silence_duration=0,
-                )
-                samples = np.asarray(wav).reshape(-1)
-                if not samples.size or not np.isfinite(samples).all():
-                    raise ValueError("Synthesis returned empty or nonfinite audio")
-                with tempfile.TemporaryDirectory(prefix=".chunk-", dir=cache) as directory:
-                    raw = Path(directory) / "raw.wav"
-                    tagged = Path(directory) / "tagged.wav"
-                    sf.write(raw, samples, tts.sample_rate, subtype="FLOAT")
-                    embed_metadata(raw, tagged, tags, False)
-                    os.replace(tagged, path)
+                if path.exists():
+                    print(f"Chunk {index}: cached audio does not match; synthesising again", file=sys.stderr)
+                if pool is not None:
+                    pending[pool.submit(synthesize_worker_chunk, chunk, path, tags)] = index
+                    continue
+                save_chunk(chunk, path, tags, tts, voice, args)
         except Exception as error:
             failed.append(index)
             print(f"\nChunk {index}/{len(chunks)} failed: {type(error).__name__}: {error}", file=sys.stderr)
-        show_progress(index, len(chunks))
+        completed += 1
+        show_progress(completed, len(chunks))
+    for future in as_completed(pending):
+        index = pending[future]
+        try:
+            future.result()
+        except Exception as error:
+            failed.append(index)
+            print(f"\nChunk {index}/{len(chunks)} failed: {type(error).__name__}: {error}", file=sys.stderr)
+        completed += 1
+        show_progress(completed, len(chunks))
     sys.stderr.write("\n")
     if failed:
         raise IncompleteSynthesisError(

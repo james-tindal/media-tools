@@ -1,10 +1,14 @@
 import argparse
 import math
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 from supertonic import TTS
 
 from batch import prepare_jobs, run_batch
+from synthesise_audio import initialize_worker, worker_description
 
 
 def parse_format(value):
@@ -37,7 +41,16 @@ def parse_args():
   parser.add_argument('--silence-duration', type=float, default=0.3)
   parser.add_argument('--buffer', type=int, default=3, help='Number of synthesised chunks to buffer ahead')
 
+  parser.add_argument('--workers', type=int, default=None, help='Synthesis workers (default: 2 for file output, 1 for playback)')
+  parser.add_argument('--threads', type=int, default=2, help='Inference threads per worker (default: 2)')
+
   args = parser.parse_args()
+  if args.workers is None:
+    args.workers = 2 if args.output is not None or args.output_dir is not None else 1
+  if args.workers < 1 or (args.threads is not None and args.threads < 1):
+    parser.error('Workers and threads must be positive integers')
+  if args.workers > 1 and args.output is None and args.output_dir is None:
+    parser.error('Multiple workers require file output')
   if (not args.voice.strip() or args.steps < 1 or args.max_chunk_length < 1
       or args.buffer < 1 or not math.isfinite(args.speed) or args.speed <= 0
       or not math.isfinite(args.silence_duration) or args.silence_duration < 0):
@@ -48,10 +61,18 @@ def main():
   args = parse_args()
   jobs = prepare_jobs(args)
   print('Loading Supertonic...', flush=True)
-  tts = TTS()
-  # All input and destination checks happen before the model loads once.
-  tts.get_voice_style(args.voice)
-  run_batch(jobs, args, tts)
+  if args.workers > 1:
+    with ProcessPoolExecutor(
+        max_workers=args.workers, mp_context=mp.get_context('spawn'),
+        initializer=initialize_worker, initargs=(args,),
+    ) as pool:
+      tts = SimpleNamespace(**pool.submit(worker_description).result())
+      run_batch(jobs, args, tts, pool)
+  else:
+    tts = TTS(intra_op_num_threads=args.threads)
+    # All input and destination checks happen before the model loads once.
+    tts.get_voice_style(args.voice)
+    run_batch(jobs, args, tts)
 
 
 if __name__ == '__main__': main()
