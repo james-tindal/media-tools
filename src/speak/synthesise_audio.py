@@ -1,12 +1,17 @@
 """Supertonic chunk synthesis, buffered playback, and Opus encoding."""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from queue import Queue
+from threading import Event
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import select
+import termios
+import tty
 import tempfile
 import subprocess
 import sys
@@ -189,6 +194,46 @@ def produce_chunks(chunks, audio, tts, voice, args):
         audio.put(None)
 
 
+@contextmanager
+def playback_keyboard(enabled):
+    if not enabled or not sys.stdin.isatty():
+        yield None
+        return
+    keyboard = sys.stdin.fileno()
+    original = termios.tcgetattr(keyboard)
+    try:
+        tty.setcbreak(keyboard)
+        print("Space: pause/resume. Ctrl+C: stop.", file=sys.stderr)
+        yield keyboard
+    finally:
+        termios.tcsetattr(keyboard, termios.TCSANOW, original)
+
+
+def play_audio(samples, sample_rate, keyboard, paused):
+    position = 0
+    finished = Event()
+
+    def callback(outdata, frames, time, status):
+        nonlocal position
+        outdata.fill(0)
+        if paused:
+            return
+        count = min(frames, len(samples) - position)
+        outdata[:count, 0] = samples[position:position + count]
+        position += count
+        if position == len(samples):
+            raise sd.CallbackStop
+
+    with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32",
+                         callback=callback, finished_callback=finished.set):
+        while not finished.wait(0.05):
+            if keyboard is not None and select.select([keyboard], [], [], 0)[0]:
+                if os.read(keyboard, 1) == b" ":
+                    paused = not paused
+                    print("\nPaused" if paused else "\nResumed", file=sys.stderr)
+    return paused
+
+
 def synthesise_audio(text, destination, tts, args):
     """Write a WAV, or play audio if destination is None."""
     chunks = split_text(text, args.max_chunk_length)
@@ -200,9 +245,10 @@ def synthesise_audio(text, destination, tts, args):
     try:
         if destination is not None:
             output = sf.SoundFile(destination, mode="w", samplerate=tts.sample_rate, channels=1)
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with playback_keyboard(destination is None) as keyboard, ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(produce_chunks, chunks, audio, tts, voice, args)
             completed = 0
+            paused = False
             # If playback or writing fails, keep draining the producer so its
             # bounded queue cannot deadlock the executor during shutdown.
             consumer_error = None
@@ -217,12 +263,14 @@ def synthesise_audio(text, destination, tts, args):
                         if output is not None:
                             output.write(np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32))
                         else:
-                            sd.sleep(int(args.silence_duration * 1000))
+                            paused = play_audio(
+                                np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32),
+                                tts.sample_rate, keyboard, paused,
+                            )
                     if output is not None:
                         output.write(wav)
                     else:
-                        sd.play(wav, tts.sample_rate)
-                        sd.wait()
+                        paused = play_audio(wav, tts.sample_rate, keyboard, paused)
                     completed += 1
                 except Exception as error:
                     consumer_error = error
