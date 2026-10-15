@@ -24,6 +24,11 @@ class SeekTests(unittest.TestCase):
                 patch.object(playback.time, "monotonic", return_value=now):
             playback.update_playback(7, controls, playback.AudioQueue(), 100)
 
+    def settle_right(self, controls, now):
+        with patch.object(playback.select, "select", return_value=([], [], [])), \
+                patch.object(playback.time, "monotonic", return_value=now):
+            playback.update_playback(7, controls, playback.AudioQueue(), 100)
+
     def test_left_restarts_and_double_left_selects_previous_within_400ms(self):
         controls = playback.PlaybackControls(chunk=3, total_chunks=5, paused=True, speed=1.5)
         self.key(controls, b"\x1b[D", 1)
@@ -54,6 +59,9 @@ class SeekTests(unittest.TestCase):
     def test_right_advances_and_does_nothing_at_last_chunk(self):
         controls = playback.PlaybackControls(chunk=2, total_chunks=4)
         self.key(controls, b"\x1bOC\x1b[C")
+        self.assertIsNone(controls.seek_chunk)
+        self.assertEqual(controls.pending_right, 4)
+        self.settle_right(controls, 1.16)
         self.assertEqual(controls.seek_chunk, 4)
         controls.chunk = 4
         controls.seek_chunk = None
@@ -63,7 +71,107 @@ class SeekTests(unittest.TestCase):
     def test_right_while_initially_buffering_selects_second_chunk(self):
         controls = playback.PlaybackControls(chunk=0, total_chunks=4)
         self.key(controls, b"\x1b[C")
+        self.assertIsNone(controls.seek_chunk)
+        self.settle_right(controls, 1.16)
         self.assertEqual(controls.seek_chunk, 2)
+
+    def test_right_repeat_delays_seek_until_quiet_and_preserves_pause(self):
+        controls = playback.PlaybackControls(chunk=2, total_chunks=10, paused=True)
+        self.key(controls, b"\x1b[C", 1)
+        self.key(controls, b"\x1b[C", 1.1)
+        self.key(controls, b"\x1b[C", 1.2)
+        self.assertEqual(controls.pending_right, 5)
+        self.assertIsNone(controls.seek_chunk)
+        self.settle_right(controls, 1.3)
+        self.assertIsNone(controls.seek_chunk)
+        self.settle_right(controls, 1.36)
+        self.assertEqual(controls.seek_chunk, 5)
+        self.assertIsNone(controls.pending_right)
+        self.assertTrue(controls.paused)
+
+    def test_right_updates_visible_counter_for_each_repeat_before_seeking(self):
+        controls = playback.PlaybackControls(chunk=2, total_chunks=10)
+        with patch("builtins.print") as output:
+            for now, expected in [(1.0, 3), (1.05, 4), (1.1, 5)]:
+                self.key(controls, b"\x1b[C", now)
+                self.assertIn(f"Chunk {expected}/10", output.call_args.args[0])
+                self.assertIsNone(controls.seek_chunk)
+                self.assertEqual(controls.chunk, 2)
+            self.settle_right(controls, 1.26)
+            self.assertIn("Chunk 5/10", output.call_args.args[0])
+            self.assertEqual(controls.seek_chunk, 5)
+
+    def test_left_cancels_pending_right_target(self):
+        controls = playback.PlaybackControls(chunk=2, total_chunks=10)
+        self.key(controls, b"\x1b[C", 1)
+        self.key(controls, b"\x1b[D", 1.1)
+        self.assertIsNone(controls.pending_right)
+        self.assertEqual(controls.seek_chunk, 2)
+        self.settle_right(controls, 1.4)
+        self.assertEqual(controls.seek_chunk, 2)
+
+    def test_held_right_starts_only_final_target_producer(self):
+        args = SimpleNamespace(max_chunk_length=300, voice="M1", buffer=1,
+                               lang=None, speed=1.05, steps=8, silence_duration=0)
+        tts = SimpleNamespace(sample_rate=100, get_voice_style=lambda voice: voice,
+                              synthesize=lambda text, **kw: (np.full(4, int(text)), None))
+        starts = []
+        played = []
+        clock = [1.0]
+        repeats = [0]
+        original_producer = playback.produce_chunks
+        original_update = playback.update_playback
+
+        def producer(chunks, *args):
+            starts.append(int(chunks[0]))
+            return original_producer(chunks, *args)
+
+        def update(keyboard, controls, audio, rate, *args, **kwargs):
+            clock[0] += 0.05
+            if controls.pending_right is not None and repeats[0] < 5:
+                controls.keys += b"\x1b[C"
+                repeats[0] += 1
+            with patch.object(playback.select, "select", return_value=([], [], [])), \
+                    patch.object(playback.time, "monotonic", return_value=clock[0]):
+                original_update(7, controls, audio, rate, *args, **kwargs)
+
+        def play(wav, rate, keyboard, controls, audio, **kwargs):
+            played.append(controls.chunk)
+            if len(played) == 1:
+                controls.keys = b"\x1b[C\x1b[C"
+                with patch.object(playback.select, "select", return_value=([], [], [])), \
+                        patch.object(playback.time, "monotonic", return_value=1.0):
+                    original_update(7, controls, audio, rate)
+
+        with patch.object(playback, "split_text", return_value=list(map(str, range(1, 11)))), \
+                patch.object(playback, "predict_durations", return_value=[1.0] * 10), \
+                patch.object(playback, "playback_keyboard", return_value=nullcontext(None)), \
+                patch.object(playback, "output_device_changes", return_value=nullcontext(None)), \
+                patch.object(playback, "produce_chunks", side_effect=producer), \
+                patch.object(playback, "play_audio", side_effect=play), \
+                patch.object(playback, "update_playback", side_effect=update):
+            playback.synthesise_audio("text", None, tts, args)
+        self.assertEqual(starts, [1, 8])
+        self.assertEqual(played, [1, 8, 9, 10])
+
+    def test_pending_right_freezes_audio_without_changing_pause_state(self):
+        driver = AudioDriver()
+        controls = playback.PlaybackControls(chunk=2, total_chunks=4)
+        original_wait = driver.wait
+
+        def wait(timeout):
+            if driver.waits == 0:
+                controls.pending_right = 3
+            else:
+                controls.pending_right = None
+                controls.seek_chunk = 3
+            return original_wait(timeout)
+
+        with driver.installed(), patch.object(driver, "wait", side_effect=wait):
+            playback.play_audio(np.ones(12), 100, None, controls, playback.AudioQueue())
+        self.assertFalse(controls.paused)
+        self.assertEqual(controls.elapsed, 0)
+        np.testing.assert_array_equal(np.concatenate(driver.blocks), np.zeros(8))
 
     def test_left_sequence_can_be_split_across_reads(self):
         controls = playback.PlaybackControls(chunk=3, total_chunks=5)
