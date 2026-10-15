@@ -117,6 +117,8 @@ def process_job(job, args, tts, pool=None):
             # Atomic create-only publication: a concurrent writer cannot be
             # overwritten between preflight and publication.
             os.link(tagged, output)
+    if opus:
+        shutil.rmtree(output.parent / f".{output.name}.chunks")
     print(f"Saved {output} (SHA-256 {metadata['source_text_sha256']})", flush=True)
 
 
