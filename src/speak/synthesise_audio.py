@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import select
 import termios
+import time
 import tty
 import tempfile
 import subprocess
@@ -222,6 +223,7 @@ def playback_keyboard(enabled):
     try:
         tty.setcbreak(keyboard)
         print("Space: pause/resume. Up/Down: playback speed. Ctrl+C: stop.", file=sys.stderr)
+        print("Chunk seeking: Left: restart; double-Left: previous; Right: next.", file=sys.stderr)
         yield keyboard
     finally:
         sys.stderr.write("\n")
@@ -258,6 +260,8 @@ class PlaybackControls:
     displayed: bool = False
     output_changed: Event | None = None
     progress: PlaybackProgress | None = None
+    seek_chunk: int | None = None
+    last_left: float | None = None
 
 
 def chunk_time(seconds):
@@ -279,6 +283,18 @@ def update_playback(keyboard, controls, audio, sample_rate, remaining=0, bufferi
                 controls.speed = min(2.0, round(controls.speed + 0.1, 1))
             elif key in (b"\x1b[B", b"\x1bOB"):
                 controls.speed = max(0.5, round(controls.speed - 0.1, 1))
+            elif key in (b"\x1b[D", b"\x1bOD"):
+                now = time.monotonic()
+                double = controls.last_left is not None and now - controls.last_left <= 0.4
+                current = controls.seek_chunk if controls.seek_chunk is not None else max(1, controls.chunk)
+                controls.seek_chunk = max(1, current - int(double))
+                controls.last_left = None if double else now
+            elif key in (b"\x1b[C", b"\x1bOC"):
+                current = controls.seek_chunk if controls.seek_chunk is not None else max(1, controls.chunk)
+                target = min(controls.total_chunks, max(1, current + 1))
+                if target != current:
+                    controls.seek_chunk = target
+                controls.last_left = None
         else:
             key, controls.keys = controls.keys[:1], controls.keys[1:]
             if key == b" ":
@@ -309,6 +325,8 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
         controls.elapsed = 0.0
         controls.duration = len(samples) / sample_rate
     update_playback(keyboard, controls, audio, sample_rate, len(samples))
+    if controls.seek_chunk is not None:
+        return
 
     with PlaybackSpeed(samples, sample_rate) as source:
         playback_complete = False
@@ -318,7 +336,7 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
         def callback(outdata, frames, time, status):
             nonlocal playback_complete
             outdata.fill(0)
-            if controls.paused or (controls.output_changed is not None
+            if controls.paused or controls.seek_chunk is not None or (controls.output_changed is not None
                                    and controls.output_changed.is_set()):
                 return
             try:
@@ -364,6 +382,9 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
                                  callback=callback, finished_callback=finished.set) as stream:
                 while True:
                     done = finished.wait(0.05)
+                    if controls.seek_chunk is not None:
+                        stream.abort()
+                        return
                     if controls.output_changed is not None and controls.output_changed.is_set():
                         stopped_at = stream.time
                         stream.abort()
@@ -437,23 +458,59 @@ def synthesise_audio(text, destination, tts, args):
                 synthesis_executor() as executor:
             future = executor.submit(produce_chunks, chunks[start_chunk - 1:], audio, tts, voice, args,
                                      keyboard is None, progress, start_chunk - 1)
-            completed = 0
+            current_chunk = start_chunk
+            loaded_chunk = None
+            wav = None
+            need_audio = True
+            add_silence = False
             controls = PlaybackControls(chunk=start_chunk - 1, total_chunks=len(chunks),
                                         output_changed=output_changed, progress=progress)
             try:
                 while True:
-                    try:
-                        wav = audio.get(timeout=0.05)
-                    except Empty:
-                        update_playback(keyboard, controls, audio, tts.sample_rate, buffering=True)
-                        continue
-                    if wav is None:
-                        break
+                    if controls.seek_chunk is not None:
+                        target = controls.seek_chunk
+                        controls.seek_chunk = None
+                        controls.chunk = target
+                        controls.elapsed = 0.0
+                        controls.duration = None
+                        if progress is not None:
+                            progress.chunk_index = target - 1
+                            progress.elapsed = 0.0
+                            progress.in_silence = False
+                        if target == loaded_chunk:
+                            need_audio = False
+                        elif loaded_chunk is not None and target == loaded_chunk + 1:
+                            need_audio = True
+                        else:
+                            audio.cancelled = True
+                            while not future.done():
+                                update_playback(keyboard, controls, audio, tts.sample_rate, buffering=True)
+                                time.sleep(0.05)
+                            future.result()
+                            audio = AudioQueue(maxsize=args.buffer)
+                            future = executor.submit(produce_chunks, chunks[target - 1:], audio, tts, voice, args,
+                                                     keyboard is None, progress, target - 1)
+                            loaded_chunk = None
+                            need_audio = True
+                        current_chunk = target
+                        add_silence = False
+                        if controls.seek_chunk is not None:
+                            continue
+                    if need_audio:
+                        try:
+                            wav = audio.get(timeout=0.05)
+                        except Empty:
+                            update_playback(keyboard, controls, audio, tts.sample_rate, buffering=True)
+                            continue
+                        if wav is None:
+                            break
+                        loaded_chunk = current_chunk
+                        need_audio = False
                     if progress is not None:
-                        progress.chunk_index = completed + start_chunk - 1
+                        progress.chunk_index = current_chunk - 1
                         progress.elapsed = 0.0
-                        progress.in_silence = bool(completed and args.silence_duration)
-                    if completed and args.silence_duration:
+                        progress.in_silence = bool(add_silence and args.silence_duration)
+                    if add_silence and args.silence_duration:
                         if output is not None:
                             output.write(np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32))
                         else:
@@ -461,14 +518,21 @@ def synthesise_audio(text, destination, tts, args):
                                 np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32),
                                 tts.sample_rate, keyboard, controls, audio, chunk=False,
                             )
+                    add_silence = False
+                    if controls.seek_chunk is not None:
+                        continue
                     if output is not None:
                         output.write(wav)
                     else:
                         progress.in_silence = False
                         progress.elapsed = 0.0
-                        controls.chunk = completed + start_chunk
+                        controls.chunk = current_chunk
                         play_audio(wav, tts.sample_rate, keyboard, controls, audio)
-                    completed += 1
+                    if controls.seek_chunk is not None:
+                        continue
+                    current_chunk += 1
+                    need_audio = True
+                    add_silence = True
                 future.result()
             except KeyboardInterrupt:
                 audio.cancelled = True
