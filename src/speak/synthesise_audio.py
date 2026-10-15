@@ -25,6 +25,7 @@ from supertonic.utils import chunk_text
 
 from audio_metadata import embed_metadata, synthesis_metadata
 from playback_speed import PlaybackSpeed
+from playback_progress import PlaybackProgress, predict_durations
 from output_device import output_device_changes, refresh_output_device
 
 
@@ -185,7 +186,7 @@ def show_progress(completed, total):
     sys.stderr.flush()
 
 
-def produce_chunks(chunks, audio, tts, voice, args, progress=True):
+def produce_chunks(chunks, audio, tts, voice, args, progress=True, playback_progress=None, start_index=0):
     if progress:
         show_progress(0, len(chunks))
     try:
@@ -199,6 +200,8 @@ def produce_chunks(chunks, audio, tts, voice, args, progress=True):
             samples = np.asarray(wav).reshape(-1)
             if not samples.size or not np.isfinite(samples).all():
                 raise ValueError(f"Invalid audio from synthesis chunk {index}")
+            if playback_progress is not None:
+                playback_progress.durations[start_index + index - 1] = len(samples) / tts.sample_rate
             if not audio.put_chunk(samples):
                 return
             if progress:
@@ -254,6 +257,7 @@ class PlaybackControls:
     duration: float | None = None
     displayed: bool = False
     output_changed: Event | None = None
+    progress: PlaybackProgress | None = None
 
 
 def chunk_time(seconds):
@@ -288,7 +292,10 @@ def update_playback(keyboard, controls, audio, sample_rate, remaining=0, bufferi
     played = max(0, controls.chunk - 1)
     if controls.duration:
         played += min(1.0, controls.elapsed / controls.duration)
-    bar = progress_bar(played, controls.total_chunks, counts=False)
+    if controls.progress is not None:
+        bar = progress_bar(controls.progress.fraction(), 1, counts=False)
+    else:
+        bar = progress_bar(played, controls.total_chunks, counts=False)
     status = (f"{state} · Chunk {controls.chunk}/{controls.total_chunks} · {timing}"
               f" · {controls.speed:.1f}× · Buffered: {seconds:.1f}s")
     print(f"{prefix}\033[2K{bar}\n\r\033[2K{status}", end="", file=sys.stderr, flush=True)
@@ -332,6 +339,8 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
                 outdata[:len(block), 0] = block
                 if len(block):
                     submitted.append((time.outputBufferDacTime, block.copy(), start, position))
+                if controls.progress is not None:
+                    controls.progress.elapsed = position
                 if chunk:
                     controls.elapsed = position
             except Exception as error:
@@ -339,6 +348,8 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
                 raise sd.CallbackAbort from error
             if len(block) < frames and not replaying:
                 playback_complete = True
+                if controls.progress is not None:
+                    controls.progress.elapsed = len(samples) / sample_rate
                 if chunk:
                     controls.elapsed = controls.duration
                 raise sd.CallbackStop
@@ -366,8 +377,11 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
                         replay.clear()
                         replay.extend(retained)
                         submitted.clear()
-                        if chunk and replay:
-                            controls.elapsed = replay[0][1]
+                        if replay:
+                            if controls.progress is not None:
+                                controls.progress.elapsed = replay[0][1]
+                            if chunk:
+                                controls.elapsed = replay[0][1]
                         playback_complete = False
                         switched = True
                         break
@@ -396,6 +410,10 @@ def synthesise_audio(text, destination, tts, args):
     if not 1 <= start_chunk <= len(chunks):
         raise ValueError(f"Start chunk must be between 1 and {len(chunks)}")
     voice = tts.get_voice_style(args.voice)
+    progress = None
+    if destination is None:
+        progress = PlaybackProgress(predict_durations(chunks, tts, voice, args),
+                                    args.silence_duration, chunk_index=start_chunk - 1)
     audio = AudioQueue(maxsize=args.buffer)
     output = None
     try:
@@ -404,10 +422,11 @@ def synthesise_audio(text, destination, tts, args):
         with output_device_changes(destination is None) as output_changed, \
                 playback_keyboard(destination is None) as keyboard, \
                 ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(produce_chunks, chunks[start_chunk - 1:], audio, tts, voice, args, keyboard is None)
+            future = executor.submit(produce_chunks, chunks[start_chunk - 1:], audio, tts, voice, args,
+                                     keyboard is None, progress, start_chunk - 1)
             completed = 0
             controls = PlaybackControls(chunk=start_chunk - 1, total_chunks=len(chunks),
-                                        output_changed=output_changed)
+                                        output_changed=output_changed, progress=progress)
             try:
                 while True:
                     try:
@@ -417,6 +436,10 @@ def synthesise_audio(text, destination, tts, args):
                         continue
                     if wav is None:
                         break
+                    if progress is not None:
+                        progress.chunk_index = completed + start_chunk - 1
+                        progress.elapsed = 0.0
+                        progress.in_silence = bool(completed and args.silence_duration)
                     if completed and args.silence_duration:
                         if output is not None:
                             output.write(np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32))
@@ -428,6 +451,8 @@ def synthesise_audio(text, destination, tts, args):
                     if output is not None:
                         output.write(wav)
                     else:
+                        progress.in_silence = False
+                        progress.elapsed = 0.0
                         controls.chunk = completed + start_chunk
                         play_audio(wav, tts.sample_rate, keyboard, controls, audio)
                     completed += 1

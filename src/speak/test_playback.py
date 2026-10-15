@@ -74,6 +74,9 @@ class AudioDriver:
 
 class PlaybackTests(unittest.TestCase):
     def setUp(self):
+        predictions = patch.object(playback, "predict_durations", side_effect=lambda chunks, *args: [1.0] * len(chunks))
+        predictions.start()
+        self.addCleanup(predictions.stop)
         self.stderr = io.StringIO()
         self.output = redirect_stderr(self.stderr)
         self.output.__enter__()
