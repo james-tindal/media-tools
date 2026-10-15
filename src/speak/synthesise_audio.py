@@ -2,7 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from queue import Queue
+from queue import Empty, Queue
 from threading import Event
 import hashlib
 import json
@@ -214,11 +214,20 @@ def playback_keyboard(enabled):
         termios.tcsetattr(keyboard, termios.TCSANOW, original)
 
 
+def update_playback(keyboard, paused, buffering=False):
+    if keyboard is None:
+        return paused
+    if select.select([keyboard], [], [], 0)[0] and os.read(keyboard, 1) == b" ":
+        paused = not paused
+    state = "⏸ Paused" if paused else "⏳ Buffering" if buffering else "▶ Playing"
+    print(f"\r\033[2K{state}", end="", file=sys.stderr, flush=True)
+    return paused
+
+
 def play_audio(samples, sample_rate, keyboard, paused):
     position = 0
     finished = Event()
-    if keyboard is not None:
-        print("\r\033[2K" + ("⏸ Paused" if paused else "▶ Playing"), end="", file=sys.stderr, flush=True)
+    paused = update_playback(keyboard, paused)
 
     def callback(outdata, frames, time, status):
         nonlocal position
@@ -234,10 +243,7 @@ def play_audio(samples, sample_rate, keyboard, paused):
     with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32",
                          callback=callback, finished_callback=finished.set):
         while not finished.wait(0.05):
-            if keyboard is not None and select.select([keyboard], [], [], 0)[0]:
-                if os.read(keyboard, 1) == b" ":
-                    paused = not paused
-                    print("\r\033[2K" + ("⏸ Paused" if paused else "▶ Playing"), end="", file=sys.stderr, flush=True)
+            paused = update_playback(keyboard, paused)
     return paused
 
 
@@ -260,7 +266,11 @@ def synthesise_audio(text, destination, tts, args):
             # bounded queue cannot deadlock the executor during shutdown.
             consumer_error = None
             while True:
-                wav = audio.get()
+                try:
+                    wav = audio.get(timeout=0.05)
+                except Empty:
+                    paused = update_playback(keyboard, paused, buffering=True)
+                    continue
                 if wav is None:
                     break
                 if consumer_error is not None:
