@@ -13,6 +13,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import synthesise_audio as playback
+import output_device
 
 
 class AudioDriver:
@@ -23,12 +24,22 @@ class AudioDriver:
         self.finished = False
         self.waits = 0
 
+    def clear(self):
+        self.finished = False
+
+    @property
+    def active(self):
+        return not self.finished
+
+    def abort(self):
+        self.finished_callback()
+
     def set(self):
         self.finished = True
 
     def wait(self, timeout):
         self.waits += 1
-        if self.waits > 100:
+        if self.waits > 1000:
             raise AssertionError("Playback did not complete")
         block = np.empty((4, 1), dtype=np.float32)
         try:
@@ -85,6 +96,74 @@ class PlaybackTests(unittest.TestCase):
                     patch.object(playback, "split_text", return_value=["first", "second", "third"]):
                 with self.assertRaisesRegex(ValueError, "Start chunk must be between 1 and 3"):
                     playback.synthesise_audio("text", None, Mock(), args)
+
+    def test_output_change_reopens_stream_without_restarting_audio(self):
+        changed = Event()
+        controls = playback.PlaybackControls(output_changed=changed)
+        driver = AudioDriver()
+        original_wait = driver.wait
+        opens = []
+        original_stream = driver.stream
+
+        def wait(timeout):
+            result = original_wait(timeout)
+            if driver.waits == 1:
+                changed.set()
+            return result
+
+        @contextmanager
+        def stream(**kwargs):
+            opens.append(True)
+            with original_stream(**kwargs) as output:
+                yield output
+
+        with driver.installed(), \
+                patch.object(driver, "wait", side_effect=wait), \
+                patch.object(playback.sd, "OutputStream", side_effect=stream), \
+                patch.object(playback, "refresh_output_device") as refresh:
+            playback.play_audio(np.arange(12, dtype=np.float32), 100, None,
+                                controls, playback.AudioQueue())
+        self.assertEqual(len(opens), 2)
+        refresh.assert_called_once_with()
+        np.testing.assert_array_equal(np.concatenate(driver.blocks)[:12], np.arange(12))
+
+    def test_device_refresh_reinitializes_before_reading_default(self):
+        calls = Mock()
+        with patch.object(output_device.sd, "_terminate", calls.terminate), \
+                patch.object(output_device.sd, "_initialize", calls.initialize), \
+                patch.object(output_device.sd, "query_devices", calls.query):
+            calls.query.return_value = {"name": "New output"}
+            self.assertEqual(output_device.refresh_output_device(), "New output")
+        self.assertEqual([call[0] for call in calls.mock_calls], ["terminate", "initialize", "query"])
+        calls.query.assert_called_once_with(kind="output")
+
+    def test_inactive_stream_raises_instead_of_waiting_forever(self):
+        controls = playback.PlaybackControls(paused=True)
+        driver = AudioDriver()
+        with driver.installed(), \
+                patch.object(driver, "wait", return_value=False), \
+                patch.object(AudioDriver, "active", False):
+            with self.assertRaisesRegex(RuntimeError, "became inactive"):
+                playback.play_audio(np.ones(12), 100, None, controls, playback.AudioQueue())
+
+    def test_output_change_preserves_pause_and_speed(self):
+        changed = Event()
+        changed.set()
+        controls = playback.PlaybackControls(paused=True, speed=1.5, output_changed=changed)
+        driver = AudioDriver()
+        original_wait = driver.wait
+
+        def wait(timeout):
+            self.assertEqual(controls.speed, 1.5)
+            if driver.waits == 1:
+                self.assertTrue(controls.paused)
+                controls.paused = False
+            return original_wait(timeout)
+
+        with driver.installed(), patch.object(driver, "wait", side_effect=wait), \
+                patch.object(playback, "refresh_output_device") as refresh:
+            playback.play_audio(np.ones(12), 24000, None, controls, playback.AudioQueue())
+        refresh.assert_called_once_with()
 
     def test_buffer_counts_samples_not_chunks_and_excludes_sentinel(self):
         audio = playback.AudioQueue(maxsize=3)

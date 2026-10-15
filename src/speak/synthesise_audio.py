@@ -24,6 +24,7 @@ from supertonic.utils import chunk_text
 
 from audio_metadata import embed_metadata, synthesis_metadata
 from playback_speed import PlaybackSpeed
+from output_device import output_device_changes, refresh_output_device
 
 
 class IncompleteSynthesisError(RuntimeError):
@@ -237,6 +238,7 @@ class PlaybackControls:
     elapsed: float = 0.0
     duration: float | None = None
     displayed: bool = False
+    output_changed: Event | None = None
 
 
 def chunk_time(seconds):
@@ -287,7 +289,10 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
     update_playback(keyboard, controls, audio, sample_rate, len(samples))
 
     with PlaybackSpeed(samples, sample_rate) as source:
+        playback_complete = False
+
         def callback(outdata, frames, time, status):
+            nonlocal playback_complete
             outdata.fill(0)
             if controls.paused:
                 return
@@ -300,14 +305,34 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
                 errors.append(error)
                 raise sd.CallbackAbort from error
             if len(block) < frames:
+                playback_complete = True
                 if chunk:
                     controls.elapsed = controls.duration
                 raise sd.CallbackStop
 
-        with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32",
-                             callback=callback, finished_callback=finished.set):
-            while not finished.wait(0.05):
-                update_playback(keyboard, controls, audio, sample_rate, source.remaining_frames)
+        while True:
+            if controls.output_changed is not None and controls.output_changed.is_set():
+                controls.output_changed.clear()
+                refresh_output_device()
+            finished.clear()
+            switched = False
+            with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32",
+                                 callback=callback, finished_callback=finished.set) as stream:
+                while True:
+                    done = finished.wait(0.05)
+                    if controls.output_changed is not None and controls.output_changed.is_set():
+                        stream.abort()
+                        switched = True
+                        break
+                    if done:
+                        if not errors and not playback_complete:
+                            raise RuntimeError("Audio output stopped before playback finished")
+                        break
+                    if not stream.active:
+                        raise RuntimeError("Audio output became inactive before playback finished")
+                    update_playback(keyboard, controls, audio, sample_rate, source.remaining_frames)
+            if not switched or errors:
+                break
         if errors:
             raise errors[0]
         update_playback(keyboard, controls, audio, sample_rate, source.remaining_frames)
@@ -329,10 +354,13 @@ def synthesise_audio(text, destination, tts, args):
     try:
         if destination is not None:
             output = sf.SoundFile(destination, mode="w", samplerate=tts.sample_rate, channels=1)
-        with playback_keyboard(destination is None) as keyboard, ThreadPoolExecutor(max_workers=1) as executor:
+        with output_device_changes(destination is None) as output_changed, \
+                playback_keyboard(destination is None) as keyboard, \
+                ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(produce_chunks, chunks[start_chunk - 1:], audio, tts, voice, args, keyboard is None)
             completed = 0
-            controls = PlaybackControls(chunk=start_chunk - 1, total_chunks=len(chunks))
+            controls = PlaybackControls(chunk=start_chunk - 1, total_chunks=len(chunks),
+                                        output_changed=output_changed)
             # If playback or writing fails, keep draining the producer so its
             # bounded queue cannot deadlock the executor during shutdown.
             consumer_error = None
