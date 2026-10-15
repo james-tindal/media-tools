@@ -1,6 +1,6 @@
 """Run with: cd src/speak && .venv/bin/python -B -m unittest -v test_playback"""
 
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, nullcontext, redirect_stderr
 import io
 from pathlib import Path
 import sys
@@ -58,6 +58,33 @@ class PlaybackTests(unittest.TestCase):
         self.output = redirect_stderr(self.stderr)
         self.output.__enter__()
         self.addCleanup(self.output.__exit__, None, None, None)
+
+    def test_start_chunk_skips_earlier_synthesis_and_preserves_numbering(self):
+        args = SimpleNamespace(max_chunk_length=300, start_chunk=2, voice="F5",
+                               buffer=3, silence_duration=0)
+        tts = SimpleNamespace(sample_rate=100, get_voice_style=Mock(return_value="voice"))
+        played = []
+
+        def produce(chunks, audio, *unused):
+            self.assertEqual(chunks, ["second", "third"])
+            audio.put(np.ones(10))
+            audio.put(np.ones(10))
+            audio.put(None)
+
+        with patch.object(playback, "split_text", return_value=["first", "second", "third"]), \
+                patch.object(playback, "produce_chunks", side_effect=produce), \
+                patch.object(playback, "playback_keyboard", return_value=nullcontext(None)), \
+                patch.object(playback, "play_audio", side_effect=lambda wav, rate, keyboard, controls, audio: played.append((controls.chunk, controls.total_chunks))):
+            playback.synthesise_audio("text", None, tts, args)
+        self.assertEqual(played, [(2, 3), (3, 3)])
+
+    def test_start_chunk_rejects_out_of_range_before_synthesis(self):
+        for start in (0, -1, 4):
+            args = SimpleNamespace(max_chunk_length=300, start_chunk=start)
+            with self.subTest(start=start), \
+                    patch.object(playback, "split_text", return_value=["first", "second", "third"]):
+                with self.assertRaisesRegex(ValueError, "Start chunk must be between 1 and 3"):
+                    playback.synthesise_audio("text", None, Mock(), args)
 
     def test_buffer_counts_samples_not_chunks_and_excludes_sentinel(self):
         audio = playback.AudioQueue(maxsize=3)

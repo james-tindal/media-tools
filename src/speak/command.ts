@@ -37,6 +37,7 @@ export default class Speak extends Command {
     steps: Flags.integer({ default: 8, description: 'Number of synthesis steps' }),
     'max-chunk-length': Flags.integer({ default: 300, description: 'Maximum text chunk length' }),
     'silence-duration': float({ default: 0.3, description: 'Silence between chunks in seconds' }),
+    'start-chunk': Flags.integer({ min: 1, description: 'Start playback at this chunk (1-based; playback only)' }),
     buffer: Flags.integer({ default: 3, description: 'Number of synthesised chunks to buffer ahead' }),
     workers: Flags.integer({ min: 1, description: 'Number of synthesis workers (default: 2 for file output, 1 for playback)' }),
     threads: Flags.integer({ default: 2, min: 1, description: 'Inference threads per worker' }),
@@ -62,6 +63,7 @@ export default class Speak extends Command {
       '--workers', String(flags.workers ?? (flags.output || flags['output-dir'] ? 2 : 1)),
     ]
 
+    if (flags['start-chunk'] !== undefined) uvArgs.push('--start-chunk', String(flags['start-chunk']))
     if (flags.threads !== undefined) uvArgs.push('--threads', String(flags.threads))
     if (flags.lang) uvArgs.push('--lang', flags.lang)
     if (flags.output) uvArgs.push('--output', flags.output)

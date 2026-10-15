@@ -39,12 +39,18 @@ def parse_args():
   parser.add_argument('--steps', type=int, default=8)
   parser.add_argument('--max-chunk-length', type=int, default=300)
   parser.add_argument('--silence-duration', type=float, default=0.3)
+  parser.add_argument('--start-chunk', type=int, default=None, help='Start playback at this chunk (1-based; playback only)')
   parser.add_argument('--buffer', type=int, default=3, help='Number of synthesised chunks to buffer ahead')
 
   parser.add_argument('--workers', type=int, default=None, help='Synthesis workers (default: 2 for file output, 1 for playback)')
   parser.add_argument('--threads', type=int, default=2, help='Inference threads per worker (default: 2)')
 
   args = parser.parse_args()
+  if args.start_chunk is not None:
+    if args.start_chunk < 1:
+      parser.error('Start chunk must be a positive integer')
+    if args.output is not None or args.output_dir is not None:
+      parser.error('--start-chunk requires playback, not file output')
   if args.workers is None:
     args.workers = 2 if args.output is not None or args.output_dir is not None else 1
   if args.workers < 1 or (args.threads is not None and args.threads < 1):

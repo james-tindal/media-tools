@@ -318,6 +318,11 @@ def synthesise_audio(text, destination, tts, args):
     chunks = split_text(text, args.max_chunk_length)
     if not chunks:
         raise ValueError("No text chunks to synthesise")
+    start_chunk = getattr(args, "start_chunk", None)
+    if start_chunk is None:
+        start_chunk = 1
+    if not 1 <= start_chunk <= len(chunks):
+        raise ValueError(f"Start chunk must be between 1 and {len(chunks)}")
     voice = tts.get_voice_style(args.voice)
     audio = AudioQueue(maxsize=args.buffer)
     output = None
@@ -325,9 +330,9 @@ def synthesise_audio(text, destination, tts, args):
         if destination is not None:
             output = sf.SoundFile(destination, mode="w", samplerate=tts.sample_rate, channels=1)
         with playback_keyboard(destination is None) as keyboard, ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(produce_chunks, chunks, audio, tts, voice, args, keyboard is None)
+            future = executor.submit(produce_chunks, chunks[start_chunk - 1:], audio, tts, voice, args, keyboard is None)
             completed = 0
-            controls = PlaybackControls(total_chunks=len(chunks))
+            controls = PlaybackControls(chunk=start_chunk - 1, total_chunks=len(chunks))
             # If playback or writing fails, keep draining the producer so its
             # bounded queue cannot deadlock the executor during shutdown.
             consumer_error = None
@@ -353,7 +358,7 @@ def synthesise_audio(text, destination, tts, args):
                     if output is not None:
                         output.write(wav)
                     else:
-                        controls.chunk = completed + 1
+                        controls.chunk = completed + start_chunk
                         play_audio(wav, tts.sample_rate, keyboard, controls, audio)
                     completed += 1
                 except Exception as error:
