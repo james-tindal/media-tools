@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Event
 import hashlib
@@ -22,6 +23,7 @@ import soundfile as sf
 from supertonic.utils import chunk_text
 
 from audio_metadata import embed_metadata, synthesis_metadata
+from playback_speed import PlaybackSpeed
 
 
 class IncompleteSynthesisError(RuntimeError):
@@ -206,7 +208,7 @@ def playback_keyboard(enabled):
     original = termios.tcgetattr(keyboard)
     try:
         tty.setcbreak(keyboard)
-        print("Space: pause/resume. Ctrl+C: stop.", file=sys.stderr)
+        print("Space: pause/resume. Up/Down: playback speed. Ctrl+C: stop.", file=sys.stderr)
         yield keyboard
     finally:
         sys.stderr.write("\n")
@@ -220,38 +222,61 @@ class AudioQueue(Queue):
             return sum(len(samples) for samples in self.queue if samples is not None)
 
 
-def update_playback(keyboard, paused, audio, sample_rate, remaining=0, buffering=False):
+@dataclass
+class PlaybackControls:
+    paused: bool = False
+    speed: float = 1.0
+    keys: bytes = b""
+
+
+def update_playback(keyboard, controls, audio, sample_rate, remaining=0, buffering=False):
     if keyboard is None:
-        return paused
-    if select.select([keyboard], [], [], 0)[0] and os.read(keyboard, 1) == b" ":
-        paused = not paused
-    state = "⏸ Paused" if paused else "⏳ Buffering" if buffering else "▶ Playing"
-    seconds = (audio.buffered_frames() + remaining) / sample_rate
-    print(f"\r\033[2K{state} · Buffered: {seconds:.1f}s", end="", file=sys.stderr, flush=True)
-    return paused
+        return
+    if select.select([keyboard], [], [], 0)[0]:
+        controls.keys += os.read(keyboard, 64)
+    while controls.keys:
+        if controls.keys.startswith(b"\x1b"):
+            if len(controls.keys) < 3:
+                break
+            key, controls.keys = controls.keys[:3], controls.keys[3:]
+            if key in (b"\x1b[A", b"\x1bOA"):
+                controls.speed = min(2.0, round(controls.speed + 0.1, 1))
+            elif key in (b"\x1b[B", b"\x1bOB"):
+                controls.speed = max(0.5, round(controls.speed - 0.1, 1))
+        else:
+            key, controls.keys = controls.keys[:1], controls.keys[1:]
+            if key == b" ":
+                controls.paused = not controls.paused
+    state = "⏸ Paused" if controls.paused else "⏳ Buffering" if buffering else "▶ Playing"
+    seconds = (audio.buffered_frames() + remaining) / sample_rate / controls.speed
+    print(f"\r\033[2K{state} · {controls.speed:.1f}× · Buffered: {seconds:.1f}s", end="", file=sys.stderr, flush=True)
 
 
-def play_audio(samples, sample_rate, keyboard, paused, audio):
-    position = 0
+def play_audio(samples, sample_rate, keyboard, controls, audio):
     finished = Event()
-    paused = update_playback(keyboard, paused, audio, sample_rate, len(samples))
+    errors = []
+    update_playback(keyboard, controls, audio, sample_rate, len(samples))
 
-    def callback(outdata, frames, time, status):
-        nonlocal position
-        outdata.fill(0)
-        if paused:
-            return
-        count = min(frames, len(samples) - position)
-        outdata[:count, 0] = samples[position:position + count]
-        position += count
-        if position == len(samples):
-            raise sd.CallbackStop
+    with PlaybackSpeed(samples, sample_rate) as source:
+        def callback(outdata, frames, time, status):
+            outdata.fill(0)
+            if controls.paused:
+                return
+            try:
+                block = source.read(frames, controls.speed)
+                outdata[:len(block), 0] = block
+            except Exception as error:
+                errors.append(error)
+                raise sd.CallbackAbort from error
+            if len(block) < frames:
+                raise sd.CallbackStop
 
-    with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32",
-                         callback=callback, finished_callback=finished.set):
-        while not finished.wait(0.05):
-            paused = update_playback(keyboard, paused, audio, sample_rate, len(samples) - position)
-    return paused
+        with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32",
+                             callback=callback, finished_callback=finished.set):
+            while not finished.wait(0.05):
+                update_playback(keyboard, controls, audio, sample_rate, source.remaining_frames)
+        if errors:
+            raise errors[0]
 
 
 def synthesise_audio(text, destination, tts, args):
@@ -268,7 +293,7 @@ def synthesise_audio(text, destination, tts, args):
         with playback_keyboard(destination is None) as keyboard, ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(produce_chunks, chunks, audio, tts, voice, args, keyboard is None)
             completed = 0
-            paused = False
+            controls = PlaybackControls()
             # If playback or writing fails, keep draining the producer so its
             # bounded queue cannot deadlock the executor during shutdown.
             consumer_error = None
@@ -276,7 +301,7 @@ def synthesise_audio(text, destination, tts, args):
                 try:
                     wav = audio.get(timeout=0.05)
                 except Empty:
-                    paused = update_playback(keyboard, paused, audio, tts.sample_rate, buffering=True)
+                    update_playback(keyboard, controls, audio, tts.sample_rate, buffering=True)
                     continue
                 if wav is None:
                     break
@@ -287,14 +312,14 @@ def synthesise_audio(text, destination, tts, args):
                         if output is not None:
                             output.write(np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32))
                         else:
-                            paused = play_audio(
+                            play_audio(
                                 np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32),
-                                tts.sample_rate, keyboard, paused, audio,
+                                tts.sample_rate, keyboard, controls, audio,
                             )
                     if output is not None:
                         output.write(wav)
                     else:
-                        paused = play_audio(wav, tts.sample_rate, keyboard, paused, audio)
+                        play_audio(wav, tts.sample_rate, keyboard, controls, audio)
                     completed += 1
                 except Exception as error:
                     consumer_error = error

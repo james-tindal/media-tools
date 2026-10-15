@@ -33,7 +33,7 @@ class AudioDriver:
         block = np.empty((4, 1), dtype=np.float32)
         try:
             self.callback(block, len(block), None, None)
-        except playback.sd.CallbackStop:
+        except (playback.sd.CallbackStop, playback.sd.CallbackAbort):
             self.finished_callback()
         self.blocks.append(block[:, 0].copy())
         return self.finished
@@ -74,26 +74,27 @@ class PlaybackTests(unittest.TestCase):
         audio = playback.AudioQueue()
         audio.put(np.ones(200))
         with patch.object(playback.select, "select", return_value=([], [], [])):
-            playback.update_playback(7, False, audio, 100, remaining=150)
-            playback.update_playback(7, True, audio, 100, remaining=50)
+            playback.update_playback(7, playback.PlaybackControls(), audio, 100, remaining=150)
+            playback.update_playback(7, playback.PlaybackControls(paused=True), audio, 100, remaining=50)
         self.assertEqual(
             self.stderr.getvalue(),
-            "\r\033[2K▶ Playing · Buffered: 3.5s"
-            "\r\033[2K⏸ Paused · Buffered: 2.5s",
+            "\r\033[2K▶ Playing · 1.0× · Buffered: 3.5s"
+            "\r\033[2K⏸ Paused · 1.0× · Buffered: 2.5s",
         )
 
     def test_space_toggles_pause_while_buffering(self):
         audio = playback.AudioQueue()
+        controls = playback.PlaybackControls()
         with patch.object(playback.select, "select", return_value=([7], [], [])), \
                 patch.object(playback.os, "read", return_value=b" "):
-            paused = playback.update_playback(7, False, audio, 100, buffering=True)
-            self.assertTrue(paused)
-            paused = playback.update_playback(7, paused, audio, 100, buffering=True)
-            self.assertFalse(paused)
+            playback.update_playback(7, controls, audio, 100, buffering=True)
+            self.assertTrue(controls.paused)
+            playback.update_playback(7, controls, audio, 100, buffering=True)
+            self.assertFalse(controls.paused)
         self.assertEqual(
             self.stderr.getvalue(),
-            "\r\033[2K⏸ Paused · Buffered: 0.0s"
-            "\r\033[2K⏳ Buffering · Buffered: 0.0s",
+            "\r\033[2K⏸ Paused · 1.0× · Buffered: 0.0s"
+            "\r\033[2K⏳ Buffering · 1.0× · Buffered: 0.0s",
         )
 
     def test_mid_chunk_pause_preserves_every_sample(self):
@@ -108,8 +109,9 @@ class PlaybackTests(unittest.TestCase):
         with driver.installed(), \
                 patch.object(playback.select, "select", side_effect=ready), \
                 patch.object(playback.os, "read", return_value=b" "):
-            paused = playback.play_audio(samples, 100, 7, False, playback.AudioQueue())
-        self.assertFalse(paused)
+            controls = playback.PlaybackControls()
+            playback.play_audio(samples, 100, 7, controls, playback.AudioQueue())
+        self.assertFalse(controls.paused)
         np.testing.assert_array_equal(driver.blocks[0], samples[:4])
         np.testing.assert_array_equal(driver.blocks[1], np.zeros(4))
         np.testing.assert_array_equal(driver.blocks[2], np.zeros(4))
@@ -141,12 +143,11 @@ class PlaybackTests(unittest.TestCase):
         update = playback.update_playback
 
         def observe(*args, **kwargs):
-            paused = update(*args, **kwargs)
+            update(*args, **kwargs)
             if kwargs.get("buffering"):
-                states.append(paused)
+                states.append(args[1].paused)
                 if len(states) == 2:
                     release.set()
-            return paused
 
         @contextmanager
         def keyboard(enabled):
@@ -165,15 +166,61 @@ class PlaybackTests(unittest.TestCase):
                 patch.object(playback.os, "read", return_value=b" "):
             playback.synthesise_audio("text", None, tts, args)
         self.assertEqual(states[:2], [True, False])
-        np.testing.assert_array_equal(np.concatenate(driver.blocks), samples)
-        self.assertIn("⏸ Paused · Buffered: 0.0s", self.stderr.getvalue())
-        self.assertIn("⏳ Buffering · Buffered: 0.0s", self.stderr.getvalue())
+        heard = np.concatenate(driver.blocks)
+        np.testing.assert_array_equal(heard[heard != 0], samples)
+        self.assertIn("⏸ Paused · 1.0× · Buffered: 0.0s", self.stderr.getvalue())
+        self.assertIn("⏳ Buffering · 1.0× · Buffered: 0.0s", self.stderr.getvalue())
 
     def test_noninteractive_status_does_not_poll_or_print(self):
+        controls = playback.PlaybackControls(paused=True)
         with patch.object(playback.select, "select") as poll:
-            self.assertTrue(playback.update_playback(None, True, playback.AudioQueue(), 100))
+            playback.update_playback(None, controls, playback.AudioQueue(), 100)
+            self.assertTrue(controls.paused)
         poll.assert_not_called()
         self.assertEqual(self.stderr.getvalue(), "")
+
+    def test_arrow_keys_handle_split_sequences_repeats_and_limits(self):
+        controls = playback.PlaybackControls(paused=True)
+        audio = playback.AudioQueue()
+        audio.put(np.ones(200))
+        with patch.object(playback.select, "select", return_value=([7], [], [])), \
+                patch.object(playback.os, "read", side_effect=[b"\x1b", b"[", b"A", b"\x1b[B", b"\x1bOA", b"\x1bOB"]):
+            for _ in range(3):
+                playback.update_playback(7, controls, audio, 100)
+            self.assertEqual(controls.speed, 1.1)
+            for expected in (1.0, 1.1, 1.0):
+                playback.update_playback(7, controls, audio, 100)
+                self.assertEqual(controls.speed, expected)
+        self.assertTrue(controls.paused)
+        for key, expected in ((b"\x1b[A" * 30, 2.0), (b"\x1b[B" * 30, 0.5)):
+            with patch.object(playback.select, "select", return_value=([7], [], [])), \
+                    patch.object(playback.os, "read", return_value=key):
+                playback.update_playback(7, controls, audio, 100)
+            self.assertEqual(controls.speed, expected)
+        self.assertIn("0.5× · Buffered: 4.0s", self.stderr.getvalue())
+
+    def test_playback_rate_persists_across_chunks(self):
+        controls = playback.PlaybackControls(speed=1.5)
+        source = Mock()
+        source.read.side_effect = [np.ones(2), np.ones(2)]
+        source.remaining_frames = 0
+        processor = Mock()
+        processor.__enter__ = Mock(return_value=source)
+        processor.__exit__ = Mock(return_value=False)
+        driver = AudioDriver()
+        with driver.installed(), patch.object(playback, "PlaybackSpeed", return_value=processor):
+            for _ in range(2):
+                playback.play_audio(np.ones(2), 24000, None, controls, playback.AudioQueue())
+        self.assertEqual(source.read.call_count, 2)
+        for call in source.read.call_args_list:
+            self.assertEqual(call.args, (4, 1.5))
+        self.assertEqual(controls.speed, 1.5)
+
+    def test_processor_failure_surfaces_outside_audio_callback(self):
+        driver = AudioDriver()
+        with driver.installed(), patch.object(playback.PlaybackSpeed, "read", side_effect=RuntimeError("processor failed")):
+            with self.assertRaisesRegex(RuntimeError, "processor failed"):
+                playback.play_audio(np.ones(8), 24000, None, playback.PlaybackControls(), playback.AudioQueue())
 
     def test_terminal_restored_after_completion_and_exception(self):
         keyboard = Mock()
