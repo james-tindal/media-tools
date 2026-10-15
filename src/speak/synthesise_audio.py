@@ -214,20 +214,27 @@ def playback_keyboard(enabled):
         termios.tcsetattr(keyboard, termios.TCSANOW, original)
 
 
-def update_playback(keyboard, paused, buffering=False):
+class AudioQueue(Queue):
+    def buffered_frames(self):
+        with self.mutex:
+            return sum(len(samples) for samples in self.queue if samples is not None)
+
+
+def update_playback(keyboard, paused, audio, sample_rate, remaining=0, buffering=False):
     if keyboard is None:
         return paused
     if select.select([keyboard], [], [], 0)[0] and os.read(keyboard, 1) == b" ":
         paused = not paused
     state = "⏸ Paused" if paused else "⏳ Buffering" if buffering else "▶ Playing"
-    print(f"\r\033[2K{state}", end="", file=sys.stderr, flush=True)
+    seconds = (audio.buffered_frames() + remaining) / sample_rate
+    print(f"\r\033[2K{state} · Buffered: {seconds:.1f}s", end="", file=sys.stderr, flush=True)
     return paused
 
 
-def play_audio(samples, sample_rate, keyboard, paused):
+def play_audio(samples, sample_rate, keyboard, paused, audio):
     position = 0
     finished = Event()
-    paused = update_playback(keyboard, paused)
+    paused = update_playback(keyboard, paused, audio, sample_rate, len(samples))
 
     def callback(outdata, frames, time, status):
         nonlocal position
@@ -243,7 +250,7 @@ def play_audio(samples, sample_rate, keyboard, paused):
     with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32",
                          callback=callback, finished_callback=finished.set):
         while not finished.wait(0.05):
-            paused = update_playback(keyboard, paused)
+            paused = update_playback(keyboard, paused, audio, sample_rate, len(samples) - position)
     return paused
 
 
@@ -253,7 +260,7 @@ def synthesise_audio(text, destination, tts, args):
     if not chunks:
         raise ValueError("No text chunks to synthesise")
     voice = tts.get_voice_style(args.voice)
-    audio = Queue(maxsize=args.buffer)
+    audio = AudioQueue(maxsize=args.buffer)
     output = None
     try:
         if destination is not None:
@@ -269,7 +276,7 @@ def synthesise_audio(text, destination, tts, args):
                 try:
                     wav = audio.get(timeout=0.05)
                 except Empty:
-                    paused = update_playback(keyboard, paused, buffering=True)
+                    paused = update_playback(keyboard, paused, audio, tts.sample_rate, buffering=True)
                     continue
                 if wav is None:
                     break
@@ -282,12 +289,12 @@ def synthesise_audio(text, destination, tts, args):
                         else:
                             paused = play_audio(
                                 np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32),
-                                tts.sample_rate, keyboard, paused,
+                                tts.sample_rate, keyboard, paused, audio,
                             )
                     if output is not None:
                         output.write(wav)
                     else:
-                        paused = play_audio(wav, tts.sample_rate, keyboard, paused)
+                        paused = play_audio(wav, tts.sample_rate, keyboard, paused, audio)
                     completed += 1
                 except Exception as error:
                     consumer_error = error
