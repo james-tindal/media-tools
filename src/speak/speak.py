@@ -1,6 +1,7 @@
 import argparse
 import math
 import multiprocessing as mp
+import os
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -85,4 +86,5 @@ if __name__ == '__main__':
   try:
     main()
   except KeyboardInterrupt:
-    raise SystemExit(130) from None
+    # Terminal and file cleanup is complete. Do not join active inference threads.
+    os._exit(130)

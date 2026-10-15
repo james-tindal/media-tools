@@ -19,10 +19,77 @@ ROOT = Path(__file__).resolve().parents[2]
 class InterruptTests(unittest.TestCase):
     def test_python_cancellation_exits_130_without_traceback(self):
         with patch.object(sys, "argv", ["speak.py", "unused.md"]), \
-                patch("batch.prepare_jobs", side_effect=KeyboardInterrupt):
+                patch("batch.prepare_jobs", side_effect=KeyboardInterrupt), \
+                patch("os._exit", side_effect=SystemExit(130)):
             with self.assertRaises(SystemExit) as result:
                 runpy.run_path(str(ROOT / "src/speak/speak.py"), run_name="__main__")
         self.assertEqual(result.exception.code, 130)
+
+    def test_ctrl_c_exits_silently_without_waiting_for_active_synthesis(self):
+        script = '''
+from contextlib import contextmanager
+import runpy, sys, time
+from threading import Event
+from types import SimpleNamespace
+from unittest.mock import patch
+import numpy as np
+import synthesise_audio as playback
+started = Event()
+calls = []
+def synthesize(*args, **kwargs):
+    calls.append(True)
+    if len(calls) == 2:
+        started.set()
+        time.sleep(30)
+    return np.ones(24), None
+def play(*args, **kwargs):
+    assert started.wait(2)
+    print("READY", flush=True)
+    time.sleep(30)
+@contextmanager
+def keyboard(enabled):
+    try:
+        yield None
+    finally:
+        print("TERMINAL RESTORED", flush=True)
+tts = SimpleNamespace(sample_rate=24000, get_voice_style=lambda voice: voice, synthesize=synthesize)
+def batch(jobs, args, model):
+    playback.synthesise_audio("text", None, model, args)
+sys.argv = ["speak.py", "unused.md"]
+with patch("supertonic.TTS", return_value=tts), \\
+     patch("batch.prepare_jobs", return_value=[]), \\
+     patch("batch.run_batch", side_effect=batch), \\
+     patch.object(playback, "split_text", return_value=["one", "two"]), \\
+     patch.object(playback, "predict_durations", return_value=[1.0, 1.0]), \\
+     patch.object(playback, "playback_keyboard", side_effect=keyboard), \\
+     patch.object(playback, "play_audio", side_effect=play):
+    runpy.run_path("speak.py", run_name="__main__")
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-B", "-u", "-c", script], cwd=ROOT / "src/speak",
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        output = b""
+        try:
+            deadline = time.monotonic() + 10
+            while b"READY" not in output:
+                self.assertLess(time.monotonic(), deadline, output.decode())
+                if select.select([process.stdout], [], [], 0.1)[0]:
+                    data = os.read(process.stdout.fileno(), 65536)
+                    self.assertTrue(data, output.decode())
+                    output += data
+            os.kill(process.pid, signal.SIGINT)
+            tail, _ = process.communicate(timeout=2)
+            output += tail
+            self.assertEqual(process.returncode, 130, output.decode())
+            self.assertIn(b"TERMINAL RESTORED", output)
+            self.assertNotIn(b"Speech stopped", output)
+            self.assertNotIn(b"Traceback", output)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+            process.stdout.close()
 
     def test_cli_waits_for_interrupted_child_cleanup(self):
         child = """import sys, time

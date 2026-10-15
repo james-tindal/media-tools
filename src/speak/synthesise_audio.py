@@ -399,6 +399,19 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
         update_playback(keyboard, controls, audio, sample_rate, source.remaining_frames)
 
 
+@contextmanager
+def synthesis_executor():
+    executor = ThreadPoolExecutor(max_workers=1)
+    wait = True
+    try:
+        yield executor
+    except KeyboardInterrupt:
+        wait = False
+        raise
+    finally:
+        executor.shutdown(wait=wait, cancel_futures=True)
+
+
 def synthesise_audio(text, destination, tts, args):
     """Write a WAV, or play audio if destination is None."""
     chunks = split_text(text, args.max_chunk_length)
@@ -421,7 +434,7 @@ def synthesise_audio(text, destination, tts, args):
             output = sf.SoundFile(destination, mode="w", samplerate=tts.sample_rate, channels=1)
         with output_device_changes(destination is None) as output_changed, \
                 playback_keyboard(destination is None) as keyboard, \
-                ThreadPoolExecutor(max_workers=1) as executor:
+                synthesis_executor() as executor:
             future = executor.submit(produce_chunks, chunks[start_chunk - 1:], audio, tts, voice, args,
                                      keyboard is None, progress, start_chunk - 1)
             completed = 0
@@ -457,6 +470,9 @@ def synthesise_audio(text, destination, tts, args):
                         play_audio(wav, tts.sample_rate, keyboard, controls, audio)
                     completed += 1
                 future.result()
+            except KeyboardInterrupt:
+                audio.cancelled = True
+                raise
             except BaseException as error:
                 audio.cancelled = True
                 print(f"\nSpeech stopped: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
