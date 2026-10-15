@@ -169,12 +169,17 @@ def synthesise_resumable(text, destination, tts, args, cache_root, conversion, p
                     output.write(block)
 
 
-def show_progress(completed, total):
+def progress_bar(completed, total, counts=True):
     width = 30
     ratio = completed / total
     filled = round(width * ratio)
     bar = "#" * filled + "-" * (width - filled)
-    sys.stderr.write(f"\rSynthesising [{bar}] {completed}/{total} {ratio:>4.0%}")
+    count = f" {completed}/{total}" if counts else ""
+    return f"[{bar}]{count} {ratio:>4.0%}"
+
+
+def show_progress(completed, total):
+    sys.stderr.write("\r" + progress_bar(completed, total))
     sys.stderr.flush()
 
 
@@ -227,6 +232,16 @@ class PlaybackControls:
     paused: bool = False
     speed: float = 1.0
     keys: bytes = b""
+    chunk: int = 0
+    total_chunks: int = 1
+    elapsed: float = 0.0
+    duration: float | None = None
+    displayed: bool = False
+
+
+def chunk_time(seconds):
+    minutes, seconds = divmod(int(seconds), 60)
+    return f"{minutes}:{seconds:02d}"
 
 
 def update_playback(keyboard, controls, audio, sample_rate, remaining=0, buffering=False):
@@ -249,12 +264,26 @@ def update_playback(keyboard, controls, audio, sample_rate, remaining=0, bufferi
                 controls.paused = not controls.paused
     state = "⏸ Paused" if controls.paused else "⏳ Buffering" if buffering else "▶ Playing"
     seconds = (audio.buffered_frames() + remaining) / sample_rate / controls.speed
-    print(f"\r\033[2K{state} · {controls.speed:.1f}× · Buffered: {seconds:.1f}s", end="", file=sys.stderr, flush=True)
+    timing = chunk_time(controls.elapsed)
+    if controls.duration is not None:
+        timing += " / " + chunk_time(controls.duration)
+    prefix = "\r\033[1A" if controls.displayed else "\r"
+    played = max(0, controls.chunk - 1)
+    if controls.duration:
+        played += min(1.0, controls.elapsed / controls.duration)
+    bar = progress_bar(played, controls.total_chunks, counts=False)
+    status = (f"{state} · Chunk {controls.chunk}/{controls.total_chunks} · {timing}"
+              f" · {controls.speed:.1f}× · Buffered: {seconds:.1f}s")
+    print(f"{prefix}\033[2K{bar}\n\r\033[2K{status}", end="", file=sys.stderr, flush=True)
+    controls.displayed = True
 
 
-def play_audio(samples, sample_rate, keyboard, controls, audio):
+def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
     finished = Event()
     errors = []
+    if chunk:
+        controls.elapsed = 0.0
+        controls.duration = len(samples) / sample_rate
     update_playback(keyboard, controls, audio, sample_rate, len(samples))
 
     with PlaybackSpeed(samples, sample_rate) as source:
@@ -265,10 +294,14 @@ def play_audio(samples, sample_rate, keyboard, controls, audio):
             try:
                 block = source.read(frames, controls.speed)
                 outdata[:len(block), 0] = block
+                if chunk:
+                    controls.elapsed = (len(samples) - source.remaining_frames) / sample_rate
             except Exception as error:
                 errors.append(error)
                 raise sd.CallbackAbort from error
             if len(block) < frames:
+                if chunk:
+                    controls.elapsed = controls.duration
                 raise sd.CallbackStop
 
         with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32",
@@ -277,6 +310,7 @@ def play_audio(samples, sample_rate, keyboard, controls, audio):
                 update_playback(keyboard, controls, audio, sample_rate, source.remaining_frames)
         if errors:
             raise errors[0]
+        update_playback(keyboard, controls, audio, sample_rate, source.remaining_frames)
 
 
 def synthesise_audio(text, destination, tts, args):
@@ -293,7 +327,7 @@ def synthesise_audio(text, destination, tts, args):
         with playback_keyboard(destination is None) as keyboard, ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(produce_chunks, chunks, audio, tts, voice, args, keyboard is None)
             completed = 0
-            controls = PlaybackControls()
+            controls = PlaybackControls(total_chunks=len(chunks))
             # If playback or writing fails, keep draining the producer so its
             # bounded queue cannot deadlock the executor during shutdown.
             consumer_error = None
@@ -314,11 +348,12 @@ def synthesise_audio(text, destination, tts, args):
                         else:
                             play_audio(
                                 np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32),
-                                tts.sample_rate, keyboard, controls, audio,
+                                tts.sample_rate, keyboard, controls, audio, chunk=False,
                             )
                     if output is not None:
                         output.write(wav)
                     else:
+                        controls.chunk = completed + 1
                         play_audio(wav, tts.sample_rate, keyboard, controls, audio)
                     completed += 1
                 except Exception as error:

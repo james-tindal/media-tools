@@ -70,16 +70,20 @@ class PlaybackTests(unittest.TestCase):
         audio.get()
         self.assertEqual(audio.buffered_frames(), 0)
 
-    def test_status_includes_current_chunk_and_replaces_one_line(self):
+    def test_status_replaces_two_lines_with_chunk_number_and_time(self):
         audio = playback.AudioQueue()
         audio.put(np.ones(200))
+        controls = playback.PlaybackControls(chunk=51, total_chunks=470, elapsed=12, duration=28)
         with patch.object(playback.select, "select", return_value=([], [], [])):
-            playback.update_playback(7, playback.PlaybackControls(), audio, 100, remaining=150)
-            playback.update_playback(7, playback.PlaybackControls(paused=True), audio, 100, remaining=50)
+            playback.update_playback(7, controls, audio, 100, remaining=150)
+            controls.paused = True
+            playback.update_playback(7, controls, audio, 100, remaining=50)
         self.assertEqual(
             self.stderr.getvalue(),
-            "\r\033[2K▶ Playing · 1.0× · Buffered: 3.5s"
-            "\r\033[2K⏸ Paused · 1.0× · Buffered: 2.5s",
+            "\r\033[2K[###---------------------------]  11%\n"
+            "\r\033[2K▶ Playing · Chunk 51/470 · 0:12 / 0:28 · 1.0× · Buffered: 3.5s"
+            "\r\033[1A\033[2K[###---------------------------]  11%\n"
+            "\r\033[2K⏸ Paused · Chunk 51/470 · 0:12 / 0:28 · 1.0× · Buffered: 2.5s",
         )
 
     def test_space_toggles_pause_while_buffering(self):
@@ -91,19 +95,19 @@ class PlaybackTests(unittest.TestCase):
             self.assertTrue(controls.paused)
             playback.update_playback(7, controls, audio, 100, buffering=True)
             self.assertFalse(controls.paused)
-        self.assertEqual(
-            self.stderr.getvalue(),
-            "\r\033[2K⏸ Paused · 1.0× · Buffered: 0.0s"
-            "\r\033[2K⏳ Buffering · 1.0× · Buffered: 0.0s",
-        )
+        self.assertIn("⏸ Paused · Chunk 0/1 · 0:00 · 1.0× · Buffered: 0.0s", self.stderr.getvalue())
+        self.assertIn("⏳ Buffering · Chunk 0/1 · 0:00 · 1.0× · Buffered: 0.0s", self.stderr.getvalue())
+        self.assertNotIn(" / ", self.stderr.getvalue())
 
     def test_mid_chunk_pause_preserves_every_sample(self):
         driver = AudioDriver()
         samples = np.arange(1, 25, dtype=np.float32)
         # Initial status, pause after one block, stay paused, then resume.
         keys = iter([False, True, False, True])
+        positions = []
 
         def ready(*args):
+            positions.append(controls.elapsed)
             return ([7] if next(keys, False) else [], [], [])
 
         with driver.installed(), \
@@ -119,7 +123,10 @@ class PlaybackTests(unittest.TestCase):
         np.testing.assert_array_equal(heard[heard != 0], samples)
         self.assertIn("⏸ Paused", self.stderr.getvalue())
         self.assertIn("▶ Playing", self.stderr.getvalue())
-        self.assertNotIn("\n", self.stderr.getvalue())
+        self.assertEqual(positions[:4], [0.0, 0.04, 0.04, 0.04])
+        self.assertAlmostEqual(controls.elapsed, 0.24)
+        self.assertAlmostEqual(controls.duration, 0.24)
+        self.assertNotIn("Synthesising", self.stderr.getvalue())
 
     def test_controls_work_before_delayed_synthesis_delivers_audio(self):
         release = Event()
@@ -168,8 +175,9 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(states[:2], [True, False])
         heard = np.concatenate(driver.blocks)
         np.testing.assert_array_equal(heard[heard != 0], samples)
-        self.assertIn("⏸ Paused · 1.0× · Buffered: 0.0s", self.stderr.getvalue())
-        self.assertIn("⏳ Buffering · 1.0× · Buffered: 0.0s", self.stderr.getvalue())
+        self.assertIn("⏸ Paused · Chunk 0/1 · 0:00 · 1.0× · Buffered: 0.0s", self.stderr.getvalue())
+        self.assertIn("⏳ Buffering · Chunk 0/1 · 0:00 · 1.0× · Buffered: 0.0s", self.stderr.getvalue())
+        self.assertIn("▶ Playing · Chunk 1/1 · 0:00 / 0:00", self.stderr.getvalue())
 
     def test_noninteractive_status_does_not_poll_or_print(self):
         controls = playback.PlaybackControls(paused=True)
@@ -215,6 +223,65 @@ class PlaybackTests(unittest.TestCase):
         for call in source.read.call_args_list:
             self.assertEqual(call.args, (4, 1.5))
         self.assertEqual(controls.speed, 1.5)
+
+    def test_chunk_timer_resets_but_inter_chunk_silence_does_not_reset_it(self):
+        driver = AudioDriver()
+        controls = playback.PlaybackControls()
+        audio = playback.AudioQueue()
+        with driver.installed():
+            playback.play_audio(np.ones(12), 4, None, controls, audio)
+            self.assertEqual((controls.elapsed, controls.duration), (3.0, 3.0))
+            playback.play_audio(np.zeros(4), 4, None, controls, audio, chunk=False)
+            self.assertEqual((controls.elapsed, controls.duration), (3.0, 3.0))
+            playback.play_audio(np.ones(8), 4, None, controls, audio)
+            self.assertEqual((controls.elapsed, controls.duration), (2.0, 2.0))
+
+    def test_bar_includes_within_chunk_progress_and_matches_chunk_boundaries(self):
+        audio = playback.AudioQueue()
+        cases = [(0, 0, None, "0%"), (1, 0, 10, "0%"),
+                 (2, 0, 10, "25%"), (2, 5, 10, "38%"),
+                 (2, 10, 10, "50%"), (3, 0, 10, "50%"),
+                 (4, 10, 10, "100%")]
+        for chunk, elapsed, duration, percent in cases:
+            with self.subTest(chunk=chunk, elapsed=elapsed), \
+                    patch.object(playback.select, "select", return_value=([], [], [])):
+                self.stderr.seek(0)
+                self.stderr.truncate()
+                controls = playback.PlaybackControls(chunk=chunk, total_chunks=4, elapsed=elapsed, duration=duration)
+                playback.update_playback(7, controls, audio, 100)
+                bar, status = self.stderr.getvalue().split("\n")
+                self.assertTrue(bar.endswith(" " + percent), bar)
+                self.assertNotIn("/", bar)
+                self.assertIn(f"Chunk {chunk}/4", status)
+
+    def test_paused_bar_does_not_advance(self):
+        controls = playback.PlaybackControls(chunk=2, total_chunks=4, elapsed=5, duration=10, paused=True)
+        audio = playback.AudioQueue()
+        with patch.object(playback.select, "select", return_value=([], [], [])):
+            playback.update_playback(7, controls, audio, 100)
+            audio.put(np.ones(100))
+            playback.update_playback(7, controls, audio, 100)
+        lines = self.stderr.getvalue().split("\n")
+        self.assertTrue(lines[0].endswith("38%"))
+        self.assertIn("[###########-------------------]  38%", lines[1])
+        self.assertEqual(controls.elapsed, 5)
+
+    def test_last_chunk_renders_100_percent_after_playback(self):
+        driver = AudioDriver()
+        controls = playback.PlaybackControls(chunk=1, total_chunks=1)
+        with driver.installed(), patch.object(playback.select, "select", return_value=([], [], [])):
+            playback.play_audio(np.ones(12), 4, 7, controls, playback.AudioQueue())
+        self.assertIn("[##############################] 100%", self.stderr.getvalue())
+        self.assertIn("Chunk 1/1 · 0:03 / 0:03", self.stderr.getvalue())
+
+    def test_file_generation_progress_keeps_chunk_counts(self):
+        playback.show_progress(51, 470)
+        self.assertEqual(self.stderr.getvalue(), "\r[###---------------------------] 51/470  11%")
+
+    def test_chunk_time_formats_minutes_without_hour_rollover(self):
+        self.assertEqual(playback.chunk_time(12.9), "0:12")
+        self.assertEqual(playback.chunk_time(61), "1:01")
+        self.assertEqual(playback.chunk_time(3601), "60:01")
 
     def test_processor_failure_surfaces_outside_audio_callback(self):
         driver = AudioDriver()
