@@ -176,8 +176,9 @@ def show_progress(completed, total):
     sys.stderr.flush()
 
 
-def produce_chunks(chunks, audio, tts, voice, args):
-    show_progress(0, len(chunks))
+def produce_chunks(chunks, audio, tts, voice, args, progress=True):
+    if progress:
+        show_progress(0, len(chunks))
     try:
         for index, chunk in enumerate(chunks, start=1):
             wav, _ = tts.synthesize(
@@ -188,9 +189,11 @@ def produce_chunks(chunks, audio, tts, voice, args):
             if not samples.size or not np.isfinite(samples).all():
                 raise ValueError(f"Invalid audio from synthesis chunk {index}")
             audio.put(samples)
-            show_progress(index, len(chunks))
+            if progress:
+                show_progress(index, len(chunks))
     finally:
-        sys.stderr.write("\n")
+        if progress:
+            sys.stderr.write("\n")
         audio.put(None)
 
 
@@ -206,12 +209,16 @@ def playback_keyboard(enabled):
         print("Space: pause/resume. Ctrl+C: stop.", file=sys.stderr)
         yield keyboard
     finally:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
         termios.tcsetattr(keyboard, termios.TCSANOW, original)
 
 
 def play_audio(samples, sample_rate, keyboard, paused):
     position = 0
     finished = Event()
+    if keyboard is not None:
+        print("\r\033[2K" + ("⏸ Paused" if paused else "▶ Playing"), end="", file=sys.stderr, flush=True)
 
     def callback(outdata, frames, time, status):
         nonlocal position
@@ -230,7 +237,7 @@ def play_audio(samples, sample_rate, keyboard, paused):
             if keyboard is not None and select.select([keyboard], [], [], 0)[0]:
                 if os.read(keyboard, 1) == b" ":
                     paused = not paused
-                    print("\nPaused" if paused else "\nResumed", file=sys.stderr)
+                    print("\r\033[2K" + ("⏸ Paused" if paused else "▶ Playing"), end="", file=sys.stderr, flush=True)
     return paused
 
 
@@ -246,7 +253,7 @@ def synthesise_audio(text, destination, tts, args):
         if destination is not None:
             output = sf.SoundFile(destination, mode="w", samplerate=tts.sample_rate, channels=1)
         with playback_keyboard(destination is None) as keyboard, ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(produce_chunks, chunks, audio, tts, voice, args)
+            future = executor.submit(produce_chunks, chunks, audio, tts, voice, args, keyboard is None)
             completed = 0
             paused = False
             # If playback or writing fails, keep draining the producer so its
