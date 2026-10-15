@@ -1,5 +1,6 @@
 """Supertonic chunk synthesis, buffered playback, and Opus encoding."""
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -290,21 +291,39 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
 
     with PlaybackSpeed(samples, sample_rate) as source:
         playback_complete = False
+        submitted = deque()
+        replay = deque()
 
         def callback(outdata, frames, time, status):
             nonlocal playback_complete
             outdata.fill(0)
-            if controls.paused:
+            if controls.paused or (controls.output_changed is not None
+                                   and controls.output_changed.is_set()):
                 return
             try:
-                block = source.read(frames, controls.speed)
+                while submitted and submitted[0][0] + len(submitted[0][1]) / sample_rate <= time.currentTime:
+                    submitted.popleft()
+                replaying = bool(replay)
+                if replaying:
+                    queued, start, end = replay.popleft()
+                    count = min(frames, len(queued))
+                    block = queued[:count]
+                    position = start + (end - start) * count / len(queued)
+                    if count < len(queued):
+                        replay.appendleft((queued[count:], position, end))
+                else:
+                    start = (len(samples) - source.remaining_frames) / sample_rate
+                    block = source.read(frames, controls.speed)
+                    position = (len(samples) - source.remaining_frames) / sample_rate
                 outdata[:len(block), 0] = block
+                if len(block):
+                    submitted.append((time.outputBufferDacTime, block.copy(), start, position))
                 if chunk:
-                    controls.elapsed = (len(samples) - source.remaining_frames) / sample_rate
+                    controls.elapsed = position
             except Exception as error:
                 errors.append(error)
                 raise sd.CallbackAbort from error
-            if len(block) < frames:
+            if len(block) < frames and not replaying:
                 playback_complete = True
                 if chunk:
                     controls.elapsed = controls.duration
@@ -321,7 +340,21 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
                 while True:
                     done = finished.wait(0.05)
                     if controls.output_changed is not None and controls.output_changed.is_set():
+                        stopped_at = stream.time
                         stream.abort()
+                        retained = deque()
+                        for dac_time, block, start, end in submitted:
+                            offset = min(len(block), max(0, round((stopped_at - dac_time) * sample_rate)))
+                            if offset < len(block):
+                                position = start + (end - start) * offset / len(block)
+                                retained.append((block[offset:], position, end))
+                        retained.extend(replay)
+                        replay.clear()
+                        replay.extend(retained)
+                        submitted.clear()
+                        if chunk and replay:
+                            controls.elapsed = replay[0][1]
+                        playback_complete = False
                         switched = True
                         break
                     if done:

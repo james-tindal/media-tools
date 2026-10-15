@@ -23,6 +23,12 @@ class AudioDriver:
         self.blocks = []
         self.finished = False
         self.waits = 0
+        self.clock = 0.0
+        self.latency = 0.0
+
+    @property
+    def time(self):
+        return self.clock
 
     def clear(self):
         self.finished = False
@@ -43,9 +49,11 @@ class AudioDriver:
             raise AssertionError("Playback did not complete")
         block = np.empty((4, 1), dtype=np.float32)
         try:
-            self.callback(block, len(block), None, None)
+            self.callback(block, len(block), SimpleNamespace(
+                currentTime=self.clock, outputBufferDacTime=self.clock + self.latency), None)
         except (playback.sd.CallbackStop, playback.sd.CallbackAbort):
             self.finished_callback()
+        self.clock += 0.04
         self.blocks.append(block[:, 0].copy())
         return self.finished
 
@@ -126,6 +134,78 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(len(opens), 2)
         refresh.assert_called_once_with()
         np.testing.assert_array_equal(np.concatenate(driver.blocks)[:12], np.arange(12))
+
+    def test_switch_retains_audio_not_yet_played_by_old_device(self):
+        changed = Event()
+        controls = playback.PlaybackControls(output_changed=changed)
+        driver = AudioDriver()
+        driver.latency = 0.02
+        original_wait = driver.wait
+        stopped = []
+
+        def wait(timeout):
+            result = original_wait(timeout)
+            if driver.waits == 1:
+                changed.set()
+            return result
+
+        def refresh():
+            stopped.append(controls.elapsed)
+            self.assertFalse(controls.paused)
+
+        with driver.installed(), patch.object(driver, "wait", side_effect=wait), \
+                patch.object(playback, "refresh_output_device", side_effect=refresh):
+            playback.play_audio(np.arange(12, dtype=np.float32), 100, None,
+                                controls, playback.AudioQueue())
+        self.assertEqual(stopped, [0.02])
+        np.testing.assert_array_equal(driver.blocks[1], [2, 3, 0, 0])
+        np.testing.assert_array_equal(driver.blocks[2], [4, 5, 6, 7])
+
+    def test_switch_does_not_resume_user_paused_playback(self):
+        changed = Event()
+        controls = playback.PlaybackControls(output_changed=changed)
+        driver = AudioDriver()
+        original_wait = driver.wait
+        switched = []
+
+        def wait(timeout):
+            if switched:
+                self.assertTrue(controls.paused)
+                controls.paused = False
+                switched.clear()
+            result = original_wait(timeout)
+            if driver.waits == 1:
+                controls.paused = True
+                changed.set()
+            return result
+
+        def refresh():
+            self.assertTrue(controls.paused)
+            switched.append(True)
+
+        with driver.installed(), patch.object(driver, "wait", side_effect=wait), \
+                patch.object(playback, "refresh_output_device", side_effect=refresh) as refresh_mock:
+            playback.play_audio(np.arange(12, dtype=np.float32), 100, None,
+                                controls, playback.AudioQueue())
+        refresh_mock.assert_called_once_with()
+
+    def test_change_signal_freezes_consumption_before_main_loop_detects_it(self):
+        changed = Event()
+        controls = playback.PlaybackControls(output_changed=changed)
+        driver = AudioDriver()
+        original_wait = driver.wait
+
+        def wait(timeout):
+            if driver.waits == 1:
+                changed.set()
+            return original_wait(timeout)
+
+        with driver.installed(), patch.object(driver, "wait", side_effect=wait), \
+                patch.object(playback, "refresh_output_device"):
+            playback.play_audio(np.arange(12, dtype=np.float32), 100, None,
+                                controls, playback.AudioQueue())
+        np.testing.assert_array_equal(driver.blocks[1], np.zeros(4))
+        np.testing.assert_array_equal(driver.blocks[2], [4, 5, 6, 7])
 
     def test_device_refresh_reinitializes_before_reading_default(self):
         calls = Mock()
