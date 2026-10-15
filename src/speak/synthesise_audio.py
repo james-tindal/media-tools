@@ -4,7 +4,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from threading import Event
 import hashlib
 import json
@@ -190,6 +190,8 @@ def produce_chunks(chunks, audio, tts, voice, args, progress=True):
         show_progress(0, len(chunks))
     try:
         for index, chunk in enumerate(chunks, start=1):
+            if audio.cancelled:
+                return
             wav, _ = tts.synthesize(
                 chunk, voice_style=voice, lang=args.lang, speed=args.speed,
                 total_steps=args.steps, silence_duration=0,
@@ -197,13 +199,14 @@ def produce_chunks(chunks, audio, tts, voice, args, progress=True):
             samples = np.asarray(wav).reshape(-1)
             if not samples.size or not np.isfinite(samples).all():
                 raise ValueError(f"Invalid audio from synthesis chunk {index}")
-            audio.put(samples)
+            if not audio.put_chunk(samples):
+                return
             if progress:
                 show_progress(index, len(chunks))
     finally:
         if progress:
             sys.stderr.write("\n")
-        audio.put(None)
+        audio.put_chunk(None)
 
 
 @contextmanager
@@ -224,6 +227,17 @@ def playback_keyboard(enabled):
 
 
 class AudioQueue(Queue):
+    cancelled = False
+
+    def put_chunk(self, samples):
+        while not self.cancelled:
+            try:
+                self.put(samples, timeout=0.05)
+                return True
+            except Full:
+                continue
+        return False
+
     def buffered_frames(self):
         with self.mutex:
             return sum(len(samples) for samples in self.queue if samples is not None)
@@ -361,7 +375,7 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
                         if not errors and not playback_complete:
                             raise RuntimeError("Audio output stopped before playback finished")
                         break
-                    if not stream.active:
+                    if not stream.active and not playback_complete:
                         raise RuntimeError("Audio output became inactive before playback finished")
                     update_playback(keyboard, controls, audio, sample_rate, source.remaining_frames)
             if not switched or errors:
@@ -394,20 +408,15 @@ def synthesise_audio(text, destination, tts, args):
             completed = 0
             controls = PlaybackControls(chunk=start_chunk - 1, total_chunks=len(chunks),
                                         output_changed=output_changed)
-            # If playback or writing fails, keep draining the producer so its
-            # bounded queue cannot deadlock the executor during shutdown.
-            consumer_error = None
-            while True:
-                try:
-                    wav = audio.get(timeout=0.05)
-                except Empty:
-                    update_playback(keyboard, controls, audio, tts.sample_rate, buffering=True)
-                    continue
-                if wav is None:
-                    break
-                if consumer_error is not None:
-                    continue
-                try:
+            try:
+                while True:
+                    try:
+                        wav = audio.get(timeout=0.05)
+                    except Empty:
+                        update_playback(keyboard, controls, audio, tts.sample_rate, buffering=True)
+                        continue
+                    if wav is None:
+                        break
                     if completed and args.silence_duration:
                         if output is not None:
                             output.write(np.zeros(round(tts.sample_rate * args.silence_duration), dtype=np.float32))
@@ -422,17 +431,11 @@ def synthesise_audio(text, destination, tts, args):
                         controls.chunk = completed + start_chunk
                         play_audio(wav, tts.sample_rate, keyboard, controls, audio)
                     completed += 1
-                except Exception as error:
-                    consumer_error = error
-            if consumer_error is not None:
-                # Retrieve any producer failure too, while keeping the original
-                # consumer failure visible as the cause.
-                try:
-                    future.result()
-                except Exception as producer_error:
-                    raise producer_error from consumer_error
-                raise consumer_error
-            future.result()
+                future.result()
+            except BaseException as error:
+                audio.cancelled = True
+                print(f"\nSpeech stopped: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+                raise
     finally:
         if output is not None:
             output.close()

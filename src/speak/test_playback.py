@@ -1,5 +1,6 @@
 """Run with: cd src/speak && .venv/bin/python -B -m unittest -v test_playback"""
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, redirect_stderr
 import io
 from pathlib import Path
@@ -216,6 +217,75 @@ class PlaybackTests(unittest.TestCase):
             self.assertEqual(output_device.refresh_output_device(), "New output")
         self.assertEqual([call[0] for call in calls.mock_calls], ["terminate", "initialize", "query"])
         calls.query.assert_called_once_with(kind="output")
+
+    def test_normal_drain_can_be_inactive_before_finished_notification(self):
+        driver = AudioDriver()
+        original_wait = driver.wait
+        waits = []
+
+        def wait(timeout):
+            waits.append(True)
+            if len(waits) == 1:
+                self.assertTrue(original_wait(timeout))
+                return False
+            return True
+
+        with driver.installed(), patch.object(driver, "wait", side_effect=wait):
+            playback.play_audio(np.ones(2), 24000, None,
+                                playback.PlaybackControls(), playback.AudioQueue())
+        self.assertEqual(len(waits), 2)
+
+    def test_full_producer_queue_can_be_cancelled(self):
+        audio = playback.AudioQueue(maxsize=1)
+        audio.put(np.ones(4))
+        started = Event()
+
+        def put():
+            started.set()
+            return audio.put_chunk(np.ones(4))
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(put)
+            self.assertTrue(started.wait(2))
+            audio.cancelled = True
+            self.assertFalse(future.result(timeout=2))
+        self.assertEqual(audio.qsize(), 1)
+
+    def test_playback_error_reports_before_inflight_synthesis_finishes(self):
+        started = Event()
+        release = Event()
+        calls = []
+        reports = []
+
+        def synthesize(text, **kwargs):
+            calls.append(text)
+            if len(calls) == 2:
+                started.set()
+                if not release.wait(2):
+                    raise AssertionError("Playback error was not reported immediately")
+            return np.ones(24), None
+
+        def fail(*args, **kwargs):
+            self.assertTrue(started.wait(2))
+            raise RuntimeError("broken output")
+
+        def report(message, **kwargs):
+            reports.append(message)
+            release.set()
+
+        args = SimpleNamespace(max_chunk_length=300, voice="F5", buffer=1,
+                               silence_duration=0, lang=None, speed=1.05, steps=8)
+        tts = SimpleNamespace(sample_rate=24000, get_voice_style=lambda voice: voice,
+                              synthesize=synthesize)
+        with patch.object(playback, "split_text", return_value=list("abcdef")), \
+                patch.object(playback, "playback_keyboard", return_value=nullcontext(None)), \
+                patch.object(playback, "output_device_changes", return_value=nullcontext(None)), \
+                patch.object(playback, "play_audio", side_effect=fail), \
+                patch("builtins.print", side_effect=report):
+            with self.assertRaisesRegex(RuntimeError, "broken output"):
+                playback.synthesise_audio("text", None, tts, args)
+        self.assertEqual(calls, ["a", "b"])
+        self.assertEqual(reports, ["\nSpeech stopped: RuntimeError: broken output"])
 
     def test_inactive_stream_raises_instead_of_waiting_forever(self):
         controls = playback.PlaybackControls(paused=True)
