@@ -81,4 +81,8 @@ def main():
     run_batch(jobs, args, tts)
 
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+  try:
+    main()
+  except KeyboardInterrupt:
+    raise SystemExit(130) from None

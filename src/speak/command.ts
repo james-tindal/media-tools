@@ -74,6 +74,9 @@ export default class Speak extends Command {
     const executable = process.platform === 'darwin' ? 'caffeinate' : 'uv'
     const spawnArgs = process.platform === 'darwin' ? ['-i', 'uv', ...uvArgs] : uvArgs
     let result: { code: number | null, signal: NodeJS.Signals | null }
+    // The terminal also signals the child. Wait for it to restore the terminal.
+    function waitForChildOnInterrupt() {}
+    process.on('SIGINT', waitForChildOnInterrupt)
     try {
       result = await new Promise((resolveResult, reject) => {
         const child = spawn(executable, spawnArgs, { stdio: 'inherit' })
@@ -83,8 +86,11 @@ export default class Speak extends Command {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       this.error(`Unable to start ${executable}: ${message}`)
+    } finally {
+      process.off('SIGINT', waitForChildOnInterrupt)
     }
 
+    if (result.code === 130 || result.signal === 'SIGINT') this.exit(130)
     if (result.code !== 0) {
       const reason = result.signal ? `signal ${result.signal}` : `exit code ${result.code}`
       this.error(`Speak failed with ${reason}`)
