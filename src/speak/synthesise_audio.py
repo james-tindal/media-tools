@@ -262,6 +262,8 @@ class PlaybackControls:
     progress: PlaybackProgress | None = None
     seek_chunk: int | None = None
     last_left: float | None = None
+    pending_left: int | None = None
+    left_repeating: bool = False
     pending_right: int | None = None
     last_right: float | None = None
 
@@ -289,11 +291,18 @@ def update_playback(keyboard, controls, audio, sample_rate, remaining=0, bufferi
                 controls.pending_right = None
                 controls.last_right = None
                 now = time.monotonic()
-                double = controls.last_left is not None and now - controls.last_left <= 0.4
-                current = controls.seek_chunk if controls.seek_chunk is not None else max(1, controls.chunk)
-                controls.seek_chunk = max(1, current - int(double))
-                controls.last_left = None if double else now
+                if (controls.pending_left is not None
+                        and (controls.left_repeating or now - controls.last_left <= 0.4)):
+                    controls.pending_left = max(1, controls.pending_left - 1)
+                    controls.left_repeating = True
+                else:
+                    controls.pending_left = (controls.seek_chunk if controls.seek_chunk is not None
+                                             else max(1, controls.chunk))
+                    controls.left_repeating = False
+                controls.last_left = now
             elif key in (b"\x1b[C", b"\x1bOC"):
+                controls.pending_left = None
+                controls.left_repeating = False
                 current = controls.pending_right
                 if current is None:
                     current = controls.seek_chunk if controls.seek_chunk is not None else max(1, controls.chunk)
@@ -306,6 +315,12 @@ def update_playback(keyboard, controls, audio, sample_rate, remaining=0, bufferi
             key, controls.keys = controls.keys[:1], controls.keys[1:]
             if key == b" ":
                 controls.paused = not controls.paused
+    if (controls.pending_left is not None
+            and time.monotonic() - controls.last_left >= (0.15 if controls.left_repeating else 0.4)):
+        controls.seek_chunk = controls.pending_left
+        controls.pending_left = None
+        controls.last_left = None
+        controls.left_repeating = False
     if (controls.pending_right is not None
             and time.monotonic() - controls.last_right >= 0.15):
         controls.seek_chunk = controls.pending_right
@@ -324,7 +339,7 @@ def update_playback(keyboard, controls, audio, sample_rate, remaining=0, bufferi
         bar = progress_bar(controls.progress.fraction(), 1, counts=False)
     else:
         bar = progress_bar(played, controls.total_chunks, counts=False)
-    displayed_chunk = controls.pending_right
+    displayed_chunk = controls.pending_left if controls.pending_left is not None else controls.pending_right
     if displayed_chunk is None:
         displayed_chunk = controls.seek_chunk if controls.seek_chunk is not None else controls.chunk
     status = (f"{state} · Chunk {displayed_chunk}/{controls.total_chunks} · {timing}"
@@ -351,8 +366,10 @@ def play_audio(samples, sample_rate, keyboard, controls, audio, chunk=True):
         def callback(outdata, frames, time, status):
             nonlocal playback_complete
             outdata.fill(0)
-            if controls.paused or controls.seek_chunk is not None or controls.pending_right is not None or (controls.output_changed is not None
-                                   and controls.output_changed.is_set()):
+            if (controls.paused or controls.seek_chunk is not None
+                    or controls.pending_left is not None or controls.pending_right is not None
+                    or (controls.output_changed is not None
+                        and controls.output_changed.is_set())):
                 return
             try:
                 while submitted and submitted[0][0] + len(submitted[0][1]) / sample_rate <= time.currentTime:
@@ -482,9 +499,9 @@ def synthesise_audio(text, destination, tts, args):
                                         output_changed=output_changed, progress=progress)
             try:
                 while True:
-                    if controls.pending_right is not None:
+                    if controls.pending_left is not None or controls.pending_right is not None:
                         update_playback(keyboard, controls, audio, tts.sample_rate, buffering=True)
-                        if controls.pending_right is not None:
+                        if controls.pending_left is not None or controls.pending_right is not None:
                             time.sleep(0.05)
                             continue
                     if controls.seek_chunk is not None:
