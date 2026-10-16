@@ -74,12 +74,45 @@ export default class Speak extends Command {
     const executable = process.platform === 'darwin' ? 'caffeinate' : 'uv'
     const spawnArgs = process.platform === 'darwin' ? ['-i', 'uv', ...uvArgs] : uvArgs
     let result: { code: number | null, signal: NodeJS.Signals | null }
-    // The terminal also signals the child. Wait for it to restore the terminal.
-    function waitForChildOnInterrupt() {}
+    const saving = Boolean(flags.output || flags['output-dir'])
+    let child: ReturnType<typeof spawn>
+    let confirmation: ReturnType<typeof setTimeout> | undefined
+    const wasRaw = process.stdin.isRaw
+    function cancelAbort() {
+      clearTimeout(confirmation)
+      confirmation = undefined
+      process.stdin.off('data', answerAbort)
+      if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw)
+      process.stdin.pause()
+    }
+    function answerAbort(data: Buffer) {
+      const answer = data.toString().toLowerCase()
+      if (answer.includes('y') || answer.includes('\u0003')) {
+        cancelAbort()
+        if (child.pid) process.kill(-child.pid, 'SIGKILL')
+      } else if (answer.includes('n')) {
+        cancelAbort()
+      }
+    }
+    function waitForChildOnInterrupt() {
+      if (!saving) return
+      if (confirmation) {
+        answerAbort(Buffer.from('y'))
+        return
+      }
+      process.stderr.write('\nSaving audio. Are you sure you want to abort? [y/N] (5 seconds)\n')
+      confirmation = setTimeout(cancelAbort, 5000)
+      if (process.stdin.isTTY) process.stdin.setRawMode(true)
+      process.stdin.on('data', answerAbort)
+      process.stdin.resume()
+    }
     process.on('SIGINT', waitForChildOnInterrupt)
     try {
       result = await new Promise((resolveResult, reject) => {
-        const child = spawn(executable, spawnArgs, { stdio: 'inherit' })
+        child = spawn(executable, spawnArgs, {
+          stdio: saving ? ['ignore', 'inherit', 'inherit'] : 'inherit',
+          detached: saving,
+        })
         child.once('error', reject)
         child.once('close', (code, signal) => resolveResult({ code, signal }))
       })
@@ -87,10 +120,11 @@ export default class Speak extends Command {
       const message = error instanceof Error ? error.message : String(error)
       this.error(`Unable to start ${executable}: ${message}`)
     } finally {
+      if (confirmation) cancelAbort()
       process.off('SIGINT', waitForChildOnInterrupt)
     }
 
-    if (result.code === 130 || result.signal === 'SIGINT') this.exit(130)
+    if (result.code === 130 || result.signal === 'SIGINT' || (saving && result.signal === 'SIGKILL')) this.exit(130)
     if (result.code !== 0) {
       const reason = result.signal ? `signal ${result.signal}` : `exit code ${result.code}`
       this.error(`Speak failed with ${reason}`)
