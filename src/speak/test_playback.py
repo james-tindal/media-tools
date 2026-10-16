@@ -74,6 +74,9 @@ class AudioDriver:
 
 class PlaybackTests(unittest.TestCase):
     def setUp(self):
+        media_keys = patch.object(playback, "mac_media_keys", side_effect=lambda *args: nullcontext(None))
+        media_keys.start()
+        self.addCleanup(media_keys.stop)
         predictions = patch.object(playback, "predict_durations", side_effect=lambda chunks, *args: [1.0] * len(chunks))
         predictions.start()
         self.addCleanup(predictions.stop)

@@ -91,7 +91,7 @@ def prepare_jobs(args):
 
 def process_job(job, args, tts, pool=None):
     if job.destination is None:
-        synthesise_audio(job.text, None, tts, args)
+        synthesise_audio(job.text, None, tts, args, title=job.source.stem)
         return
     output = job.destination
     output.parent.mkdir(parents=True, exist_ok=True)

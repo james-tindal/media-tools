@@ -28,6 +28,7 @@ from audio_metadata import embed_metadata, synthesis_metadata
 from playback_speed import PlaybackSpeed
 from playback_progress import PlaybackProgress, predict_durations
 from output_device import output_device_changes, refresh_output_device
+from media_keys import MacMediaKeys, mac_media_keys
 
 
 class IncompleteSynthesisError(RuntimeError):
@@ -266,6 +267,7 @@ class PlaybackControls:
     left_repeating: bool = False
     pending_right: int | None = None
     last_right: float | None = None
+    media_keys: MacMediaKeys | None = None
 
 
 def chunk_time(seconds):
@@ -274,9 +276,9 @@ def chunk_time(seconds):
 
 
 def update_playback(keyboard, controls, audio, sample_rate, remaining=0, buffering=False):
-    if keyboard is None:
-        return
-    if select.select([keyboard], [], [], 0)[0]:
+    if controls.media_keys is not None:
+        controls.media_keys.poll()
+    if keyboard is not None and select.select([keyboard], [], [], 0)[0]:
         controls.keys += os.read(keyboard, 64)
     while controls.keys:
         if controls.keys.startswith(b"\x1b"):
@@ -326,6 +328,10 @@ def update_playback(keyboard, controls, audio, sample_rate, remaining=0, bufferi
         controls.seek_chunk = controls.pending_right
         controls.pending_right = None
         controls.last_right = None
+    if controls.media_keys is not None:
+        controls.media_keys.update_state()
+    if keyboard is None:
+        return
     target = controls.pending_left if controls.pending_left is not None else controls.pending_right
     if target is None:
         target = controls.seek_chunk
@@ -475,7 +481,7 @@ def synthesis_executor():
         executor.shutdown(wait=wait, cancel_futures=True)
 
 
-def synthesise_audio(text, destination, tts, args):
+def synthesise_audio(text, destination, tts, args, title="media-tools speak"):
     """Write a WAV, or play audio if destination is None."""
     chunks = split_text(text, args.max_chunk_length)
     if not chunks:
@@ -495,9 +501,13 @@ def synthesise_audio(text, destination, tts, args):
     try:
         if destination is not None:
             output = sf.SoundFile(destination, mode="w", samplerate=tts.sample_rate, channels=1)
+        controls = PlaybackControls(chunk=start_chunk - 1, total_chunks=len(chunks), progress=progress)
         with output_device_changes(destination is None) as output_changed, \
                 playback_keyboard(destination is None) as keyboard, \
-                synthesis_executor() as executor:
+                synthesis_executor() as executor, \
+                mac_media_keys(controls, title, destination is None) as media_keys:
+            controls.output_changed = output_changed
+            controls.media_keys = media_keys
             future = executor.submit(produce_chunks, chunks[start_chunk - 1:], audio, tts, voice, args,
                                      keyboard is None, progress, start_chunk - 1)
             current_chunk = start_chunk
@@ -505,8 +515,6 @@ def synthesise_audio(text, destination, tts, args):
             wav = None
             need_audio = True
             add_silence = False
-            controls = PlaybackControls(chunk=start_chunk - 1, total_chunks=len(chunks),
-                                        output_changed=output_changed, progress=progress)
             try:
                 while True:
                     if controls.pending_left is not None or controls.pending_right is not None:

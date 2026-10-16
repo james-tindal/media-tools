@@ -27,7 +27,7 @@ class InterruptTests(unittest.TestCase):
 
     def test_ctrl_c_exits_silently_without_waiting_for_active_synthesis(self):
         script = '''
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import runpy, sys, time
 from threading import Event
 from types import SimpleNamespace
@@ -62,6 +62,7 @@ with patch("supertonic.TTS", return_value=tts), \\
      patch.object(playback, "split_text", return_value=["one", "two"]), \\
      patch.object(playback, "predict_durations", return_value=[1.0, 1.0]), \\
      patch.object(playback, "playback_keyboard", side_effect=keyboard), \\
+     patch.object(playback, "mac_media_keys", side_effect=lambda *args: nullcontext(None)), \\
      patch.object(playback, "play_audio", side_effect=play):
     runpy.run_path("speak.py", run_name="__main__")
 '''

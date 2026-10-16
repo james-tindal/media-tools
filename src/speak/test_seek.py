@@ -15,6 +15,9 @@ from playback_progress import PlaybackProgress
 
 class SeekTests(unittest.TestCase):
     def setUp(self):
+        media_keys = patch.object(playback, "mac_media_keys", side_effect=lambda *args: nullcontext(None))
+        media_keys.start()
+        self.addCleanup(media_keys.stop)
         output = redirect_stderr(io.StringIO())
         output.__enter__()
         self.addCleanup(output.__exit__, None, None, None)
@@ -317,6 +320,7 @@ class SeekTests(unittest.TestCase):
         def wait(timeout):
             if driver.waits == 0:
                 controls.pending_right = 3
+                controls.last_right = playback.time.monotonic()
             else:
                 controls.pending_right = None
                 controls.seek_chunk = 3
