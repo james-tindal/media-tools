@@ -35,7 +35,7 @@ def parse_args():
   parser.add_argument('--format', type=parse_format, metavar='opus[:KBPS]',
                       help='Encode Opus with FFmpeg using a target bitrate in kbps (default: 24). Requires --output')
   parser.add_argument('--voice', default='M1')
-  parser.add_argument('--lang', default=None)
+  parser.add_argument('--lang', default='en')
   parser.add_argument('--speed', type=float, default=1.05)
   parser.add_argument('--steps', type=int, default=8)
   parser.add_argument('--max-chunk-length', type=int, default=300)

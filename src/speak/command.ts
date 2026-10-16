@@ -32,7 +32,7 @@ export default class Speak extends Command {
     format: Flags.string({ description: 'Opus encoding: opus or opus:N, where N is the bitrate in kbps (default: 24)' }),
     overwrite: Flags.boolean({ description: 'Replace existing audio after synthesis and verification succeed' }),
     voice: Flags.string({ default: 'M1', description: 'Supertonic voice style' }),
-    lang: Flags.string({ description: 'Language code' }),
+    lang: Flags.string({ default: 'en', description: 'Language code' }),
     speed: float({ default: 1.05, description: 'Speech speed' }),
     steps: Flags.integer({ default: 8, description: 'Number of synthesis steps' }),
     'max-chunk-length': Flags.integer({ default: 300, description: 'Maximum text chunk length' }),
