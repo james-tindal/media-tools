@@ -3,7 +3,7 @@
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from queue import Empty, Full, Queue
 from threading import Event
 import hashlib
@@ -326,24 +326,34 @@ def update_playback(keyboard, controls, audio, sample_rate, remaining=0, bufferi
         controls.seek_chunk = controls.pending_right
         controls.pending_right = None
         controls.last_right = None
-    state = "⏸ Paused" if controls.paused else "⏳ Buffering" if buffering else "▶ Playing"
-    seconds = (audio.buffered_frames() + remaining) / sample_rate / controls.speed
-    timing = chunk_time(controls.elapsed)
-    if controls.duration is not None:
-        timing += " / " + chunk_time(controls.duration)
+    target = controls.pending_left if controls.pending_left is not None else controls.pending_right
+    if target is None:
+        target = controls.seek_chunk
+    seeking = target is not None or audio.cancelled
+    displayed_chunk = target if target is not None else controls.chunk
+    progress = controls.progress
+    played = max(0, displayed_chunk - 1)
+    if seeking:
+        state = "Seeking · ⏸ Paused" if controls.paused else "Seeking"
+        timing = "0:00"
+        buffer_status = ""
+        if progress is not None:
+            progress = replace(progress, chunk_index=displayed_chunk - 1, elapsed=0.0, in_silence=False)
+    else:
+        state = "⏸ Paused" if controls.paused else "⏳ Buffering" if buffering else "▶ Playing"
+        seconds = (audio.buffered_frames() + remaining) / sample_rate / controls.speed
+        buffer_status = f" · Buffered: {seconds:.1f}s"
+        timing = chunk_time(controls.elapsed)
+        if controls.duration is not None:
+            timing += " / " + chunk_time(controls.duration)
+            played += min(1.0, controls.elapsed / controls.duration)
     prefix = "\r\033[1A" if controls.displayed else "\r"
-    played = max(0, controls.chunk - 1)
-    if controls.duration:
-        played += min(1.0, controls.elapsed / controls.duration)
-    if controls.progress is not None:
-        bar = progress_bar(controls.progress.fraction(), 1, counts=False)
+    if progress is not None:
+        bar = progress_bar(progress.fraction(), 1, counts=False)
     else:
         bar = progress_bar(played, controls.total_chunks, counts=False)
-    displayed_chunk = controls.pending_left if controls.pending_left is not None else controls.pending_right
-    if displayed_chunk is None:
-        displayed_chunk = controls.seek_chunk if controls.seek_chunk is not None else controls.chunk
     status = (f"{state} · Chunk {displayed_chunk}/{controls.total_chunks} · {timing}"
-              f" · {controls.speed:.1f}× · Buffered: {seconds:.1f}s")
+              f" · {controls.speed:.1f}×{buffer_status}")
     print(f"{prefix}\033[2K{bar}\n\r\033[2K{status}", end="", file=sys.stderr, flush=True)
     controls.displayed = True
 

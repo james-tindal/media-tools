@@ -10,6 +10,7 @@ import numpy as np
 
 import synthesise_audio as playback
 from test_playback import AudioDriver
+from playback_progress import PlaybackProgress
 
 
 class SeekTests(unittest.TestCase):
@@ -112,6 +113,66 @@ class SeekTests(unittest.TestCase):
             self.settle_right(controls, 1.26)
             self.assertIn("Chunk 5/10", output.call_args.args[0])
             self.assertEqual(controls.seek_chunk, 5)
+
+    def test_right_preview_updates_all_status_fields_without_changing_position(self):
+        progress = PlaybackProgress([1.0, 5.0, 2.0], 1, chunk_index=1, elapsed=3)
+        controls = playback.PlaybackControls(chunk=2, total_chunks=3, elapsed=3, duration=5,
+                                             paused=True, speed=1.5, progress=progress)
+        with patch("builtins.print") as output:
+            self.key(controls, b"\x1b[C", 1)
+            preview = output.call_args.args[0]
+            self.assertIn("80%", preview)
+            self.assertIn("Seeking · ⏸ Paused · Chunk 3/3 · 0:00 · 1.5×", preview)
+            self.assertNotIn("Buffered:", preview)
+            self.assertNotIn("0:03", preview)
+            self.assertNotIn(" / 0:05", preview)
+            self.settle_right(controls, 1.16)
+            self.assertIn("Seeking", output.call_args.args[0])
+            self.assertIn("80%", output.call_args.args[0])
+        self.assertEqual((controls.chunk, controls.elapsed, controls.duration), (2, 3, 5))
+        self.assertEqual((progress.chunk_index, progress.elapsed), (1, 3))
+        self.assertTrue(controls.paused)
+
+    def test_seek_status_stays_consistent_while_old_producer_stops(self):
+        progress = PlaybackProgress([1.0, 5.0, 2.0], 1, chunk_index=2)
+        controls = playback.PlaybackControls(chunk=3, total_chunks=3, progress=progress)
+        audio = playback.AudioQueue()
+        audio.put(np.ones(100))
+        audio.cancelled = True
+        with patch.object(playback.select, "select", return_value=([], [], [])), \
+                patch("builtins.print") as output:
+            playback.update_playback(7, controls, audio, 100, buffering=True)
+        status = output.call_args.args[0]
+        self.assertIn("80%", status)
+        self.assertIn("Seeking · Chunk 3/3 · 0:00", status)
+        self.assertNotIn("Buffered:", status)
+
+    def test_left_preview_tracks_double_tap_and_debounce(self):
+        progress = PlaybackProgress([1.0, 5.0, 2.0], 1, chunk_index=1, elapsed=3)
+        controls = playback.PlaybackControls(chunk=2, total_chunks=3, elapsed=3, duration=5,
+                                             progress=progress)
+        with patch("builtins.print") as output:
+            self.key(controls, b"\x1b[D", 1)
+            self.assertIn("20%", output.call_args.args[0])
+            self.assertIn("Seeking · Chunk 2/3 · 0:00", output.call_args.args[0])
+            self.assertNotIn("Buffered:", output.call_args.args[0])
+            self.key(controls, b"\x1b[D", 1.3)
+            self.assertIn("0%", output.call_args.args[0])
+            self.assertIn("Seeking · Chunk 1/3 · 0:00", output.call_args.args[0])
+            self.settle_right(controls, 1.46)
+            self.assertIn("Seeking · Chunk 1/3 · 0:00", output.call_args.args[0])
+            # Once the consumer starts the new chunk, normal status returns.
+            controls.seek_chunk = None
+            controls.chunk = 1
+            controls.elapsed = 0
+            controls.duration = 1
+            progress.chunk_index = 0
+            progress.elapsed = 0
+            self.settle_right(controls, 1.5)
+            normal = output.call_args.args[0]
+            self.assertIn("▶ Playing · Chunk 1/3 · 0:00 / 0:01", normal)
+            self.assertIn("Buffered:", normal)
+            self.assertNotIn("Seeking", normal)
 
     def test_left_cancels_pending_right_target(self):
         controls = playback.PlaybackControls(chunk=2, total_chunks=10)
